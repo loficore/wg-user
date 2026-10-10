@@ -3,7 +3,8 @@
 
 set -e
 
-# Locate the module root (same fallback strategy as install.sh).
+trace() { printf 'wg-user uninstall: %s\n' "$*" >&2; }
+
 MODDIR=""
 
 case "$0" in
@@ -21,11 +22,21 @@ if [ -z "$MODDIR" ]; then
 fi
 
 if [ -z "$MODDIR" ]; then
+    resolve_fd_target() {
+        fd_path="$1"
+        target="$(readlink "$fd_path" 2>/dev/null)" || return 1
+        case "$target" in
+            /*) echo "$target"; return 0 ;;
+            *)  abs_dir="$(CDPATH= cd -- "$(dirname -- "$target")" 2>/dev/null && pwd 2>/dev/null)" || return 1
+                echo "$abs_dir/$(basename -- "$target")"
+                return 0 ;;
+        esac
+    }
     for fd in /proc/self/fd/*; do
-        target="$(readlink "$fd" 2>/dev/null)" || continue
+        target="$(resolve_fd_target "$fd")" || continue
         case "$target" in
             */install.sh|*/customize.sh|*/uninstall.sh)
-                cand="$(dirname "$target")"
+                cand="$(dirname -- "$target")"
                 if [ -f "$cand/module.prop" ]; then MODDIR="$cand"; break; fi
                 ;;
         esac
@@ -37,10 +48,10 @@ if [ -z "$MODDIR" ]; then
     [ -f "$cand/module.prop" ] && MODDIR="$cand"
 fi
 
-# Stop the daemons; do not abort on failure (they may not be running).
+trace "MODDIR=${MODDIR:-<not found>}"
+
 if [ -n "$MODDIR" ] && [ -x "$MODDIR/wg-user" ]; then
     "$MODDIR/wg-user" stop 2>/dev/null || true
 fi
-# Best-effort cleanup regardless of whether we found the root.
 rm -f "${MODDIR:-.}/run/wireproxy.pid" "${MODDIR:-.}/run/wstunnel.pid" "${MODDIR:-.}/run/watcher.pid"
 exit 0

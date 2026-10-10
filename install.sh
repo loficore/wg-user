@@ -4,117 +4,102 @@
 
 set -e
 
-# ---------------------------------------------------------------------------
-# Verbose stderr helper that works even BEFORE common/util.sh is sourced.
-# We use this to trace which fallback resolved the module root, so the KSU
-# install log tells us exactly what happened.
-# ---------------------------------------------------------------------------
 trace() { printf 'wg-user install: %s\n' "$*" >&2; }
 
-# ---------------------------------------------------------------------------
-# Locate the module root. The root manager (KSU / Magisk) can invoke this
-# script in several ways:
-#
-#   1. sh -c '. /abs/path/install.sh'    (sourced, $0='sh')
-#   2. sh /abs/path/install.sh           (exec'd, $0=absolute)
-#   3. . /abs/path/install.sh            (sourced, $0 may be anything)
-#   4. . install.sh                      (sourced, $0 inherited, pwd has the file)
-#
-# $0 is unreliable in case (1)/(3)/(4); in case (1) the script's actual
-# on-disk path is available via /proc/self/fd/<N> (the shell keeps the
-# source file open as an fd). In case (2), $0 itself is the answer.
-# Env vars (MODPATH, MODDIR) cover cases where the manager exports them.
-# ---------------------------------------------------------------------------
+# ---- Diagnostic dump: print everything we know about our context ----
+trace "--- diagnostics ---"
+trace "  \$0='$0'"
+trace "  MODPATH='${MODPATH:-}'"
+trace "  MODDIR='${MODDIR:-}'"
+trace "  pwd='$(pwd)'"
+trace "  /proc/self/exe='$(readlink /proc/self/exe 2>/dev/null)'"
+ppid=$(awk '/^PPid:/{print $2}' /proc/self/status 2>/dev/null)
+trace "  PPid=$ppid"
+if [ -n "$ppid" ] && [ -r "/proc/$ppid/cmdline" ]; then
+    ppid_cmdline=$(tr '\0' ' ' < "/proc/$ppid/cmdline" 2>/dev/null)
+    trace "  /proc/$ppid/cmdline='$ppid_cmdline'"
+fi
+trace "  /proc/self/fd/ entries:"
+for fd in /proc/self/fd/*; do
+    fd_target="$(readlink "$fd" 2>/dev/null)"
+    [ -n "$fd_target" ] && trace "    $fd -> $fd_target"
+done
+trace "---"
 
-MODDIR=""
-
-# Resolve a possibly-relative path under /proc/self/fd.
-# readlink on Android's mksh may not follow the symlink; fall back to
-# manual resolution via cd + pwd if readlink gives us a relative path.
+# Resolve fd target (handles both absolute and relative paths from readlink).
 resolve_fd_target() {
     fd_path="$1"
     target="$(readlink "$fd_path" 2>/dev/null)" || return 1
     case "$target" in
-        /*) echo "$target"; return 0 ;;
-        *)  # relative — resolve against current dir
-            dir_part="$(dirname -- "$target")"
-            base_part="$(basename -- "$target")"
-            abs_dir="$(CDPATH= cd -- "$dir_part" 2>/dev/null && pwd 2>/dev/null)" || return 1
-            echo "$abs_dir/$base_part"
-            return 0
-            ;;
+        /*) printf '%s\n' "$target"; return 0 ;;
+        *)  abs_dir="$(CDPATH= cd -- "$(dirname -- "$target")" 2>/dev/null && pwd 2>/dev/null)" || return 1
+            printf '%s/%s\n' "$abs_dir" "$(basename -- "$target")"
+            return 0 ;;
     esac
 }
 
+# is_script_name: matches install.sh, customize.sh, uninstall.sh
+is_script_name() {
+    case "$1" in
+        */install.sh) return 0 ;;
+        */customize.sh) return 0 ;;
+        */uninstall.sh) return 0 ;;
+    esac
+    return 1
+}
+
+try_moddir() {
+    cand="$1"
+    [ -n "$cand" ] || return 1
+    [ -f "$cand/module.prop" ] || { trace "  $cand: no module.prop"; return 1; }
+    [ -f "$cand/common/util.sh" ] || { trace "  $cand: no common/util.sh"; return 1; }
+    MODDIR="$cand"
+    return 0
+}
+
+MODDIR=""
+
 # 1. $0 if absolute.
 case "$0" in
-    /*)
-        cand="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
-        if [ -f "$cand/module.prop" ] && [ -f "$cand/common/util.sh" ]; then
-            MODDIR="$cand"
-            trace "resolved via \$0: $cand"
-        else
-            trace "\$0 absolute but $cand lacks module.prop/common/util.sh"
-        fi
-        ;;
-    *)
-        trace "\$0 not absolute ($0); trying env"
-        ;;
+    /*) try_moddir "$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)" && trace "resolved via \$0" ;;
 esac
 
-# 2. Well-known env vars.
-if [ -z "$MODDIR" ]; then
-    for cand in "${MODPATH:-}" "${MODDIR:-}"; do
-        [ -n "$cand" ] || continue
-        if [ -f "$cand/module.prop" ] && [ -f "$cand/common/util.sh" ]; then
-            MODDIR="$cand"
-            trace "resolved via env: $cand"
-            break
-        else
-            trace "env $cand: missing module.prop or common/util.sh"
-        fi
-    done
-fi
+# 2. Env vars.
+[ -z "$MODDIR" ] && for cand in "${MODPATH:-}" "${MODDIR:-}"; do
+    [ -n "$cand" ] || continue
+    try_moddir "$cand" && trace "resolved via env $cand"
+done
 
-# 3. /proc/self/fd scan — the killer feature for sourced scripts.
-#    The shell keeps the source file open as an fd. /proc/self/fd lists
-#    all open fds; readlink on each gives the on-disk path of the file.
-if [ -z "$MODDIR" ]; then
-    trace "falling back to /proc/self/fd scan"
-    found_via_fd=0
-    for fd in /proc/self/fd/*; do
+# 3. /proc/self/fd scan.
+[ -z "$MODDIR" ] && for fd in /proc/self/fd/*; do
+    target="$(resolve_fd_target "$fd")" || continue
+    is_script_name "$target" || continue
+    try_moddir "$(dirname -- "$target")" && trace "resolved via /proc/self/fd $fd"
+done
+[ -z "$MODDIR" ] && trace "/proc/self/fd scan: no match"
+
+# 4. /proc/<ppid>/fd scan (parent KSU process may still hold the fd).
+[ -z "$MODDIR" ] && [ -n "$ppid" ] && [ -d "/proc/$ppid/fd" ] && {
+    trace "scanning /proc/$ppid/fd"
+    for fd in "/proc/$ppid/fd"/*; do
         target="$(resolve_fd_target "$fd")" || continue
-        case "$target" in
-            */install.sh|*/customize.sh|*/uninstall.sh)
-                cand="$(dirname -- "$target")"
-                if [ -f "$cand/module.prop" ] && [ -f "$cand/common/util.sh" ]; then
-                    MODDIR="$cand"
-                    found_via_fd=1
-                    trace "resolved via /proc/self/fd scan: $cand (from $target)"
-                    break
-                fi
-                ;;
-        esac
+        is_script_name "$target" || continue
+        try_moddir "$(dirname -- "$target")" && trace "resolved via /proc/$ppid/fd $fd"
     done
-    [ "$found_via_fd" -eq 0 ] && trace "/proc/self/fd scan: no match"
-fi
+    [ -z "$MODDIR" ] && trace "/proc/$ppid/fd scan: no match"
+}
 
-# 4. Current working directory (only correct when manager did
-#    `cd module_dir; . install.sh` — fragile).
-if [ -z "$MODDIR" ]; then
-    cand="$(pwd)"
-    if [ -f "$cand/module.prop" ] && [ -f "$cand/common/util.sh" ]; then
-        MODDIR="$cand"
-        trace "resolved via pwd: $cand"
-    else
-        trace "pwd $cand: missing module.prop or common/util.sh"
-    fi
-fi
+# 5. Brute force: find module.prop under /data/adb/.
+[ -z "$MODDIR" ] && trace "falling back to filesystem search under /data/adb"
+[ -z "$MODDIR" ] && for cand in /data/adb/modules/wg-user /data/adb/modules_update/wg-user; do
+    try_moddir "$cand" && trace "resolved via /data/adb search: $cand"
+done
+
+# 6. pwd (last resort).
+[ -z "$MODDIR" ] && try_moddir "$(pwd)" && trace "resolved via pwd"
 
 if [ -z "$MODDIR" ]; then
-    trace "FATAL: cannot locate module root"
-    trace "  \$0='$0'  MODPATH='${MODPATH:-}'  MODDIR='${MODDIR:-}'  pwd='$(pwd)'"
-    trace "  /proc/self/fd scan did not find a module.prop sibling."
+    trace "FATAL: cannot locate module root after all 6 strategies"
     exit 1
 fi
 

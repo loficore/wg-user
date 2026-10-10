@@ -1,0 +1,60 @@
+# =============================================================================
+# wg-user / wireproxy configuration reference
+# =============================================================================
+# This file follows the wireproxy INI format. The required sections are
+# [Interface] and [Peer]; at least one of [Socks5], [HTTP], or [TCPClientTunnel]
+# must be present to actually accept traffic.
+#
+# All string values may reference environment variables: $MY_VAR.
+# Use $$ to escape a literal $ (e.g. for a password containing $).
+#
+# Most fields are case-insensitive. Section names are case-sensitive.
+# =============================================================================
+
+# === [Interface] — this client ===
+[Interface]
+# Required. The IPv4 (/32) and/or IPv6 (/128) address inside the WG network.
+Address = 10.0.0.2/32
+# Required. Base64-encoded private key for this client. Keep this SECRET.
+# Generate with: wg genkey | tee privatekey | wg pubkey > publickey
+PrivateKey = <base64>
+# Optional. DNS servers reachable through the tunnel. Used by wireproxy for
+# the WG endpoint hostname (e.g. if Endpoint is a hostname).
+DNS = 10.0.0.1
+# Optional. Default 1420.
+# MTU = 1420
+
+# === [Peer] — the remote WG server ===
+[Peer]
+# Required. Base64-encoded public key of the remote peer.
+PublicKey = <base64>
+# Required. host:port of the remote WireGuard UDP listener.
+# If you enable wstunnel in etc/tunnel.conf, change this to 127.0.0.1:51820
+# (the local-udp from tunnel.conf) — wstunnel then forwards to the real
+# server over TLS/443.
+Endpoint = wireguard.example.com:51820
+# Optional. Pre-shared key (extra layer of post-quantum-ready symmetric key).
+# PresharedKey =
+# Optional. Default 0 (off). 25 is a sensible value on mobile networks.
+PersistentKeepalive = 25
+# Optional but important. AllowedIPs is the allowlist of CIDRs the SOCKS5
+# clients can reach THROUGH this peer. To allow all: 0.0.0.0/0, ::/0
+AllowedIPs = 0.0.0.0/0
+
+# === One or more of these inbound sections ===
+[Socks5]
+BindAddress = 127.0.0.1:1080
+# Optional. If set, SOCKS5 auth is required.
+# Username = user
+# Password = pass
+
+# [HTTP]
+# BindAddress = 127.0.0.1:8080
+# Username = user
+# Password = pass
+# CertFile = /path/to/cert.pem
+# KeyFile  = /path/to/key.pem
+
+# [TCPClientTunnel] — listen on a local port, forward to remote through WG.
+# BindAddress = 127.0.0.1:3389
+# Target      = remotehost:3389

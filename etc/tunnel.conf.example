@@ -1,0 +1,30 @@
+# =============================================================================
+# wg-user obfuscation transport — configuration reference
+# =============================================================================
+# wstunnel docs: https://github.com/erebe/wstunnel
+#
+# Recommended VPS setup (see docs/TUNNEL-SERVER.md):
+#   wstunnel server wss://0.0.0.0:443 --restrict-to 127.0.0.1:51820
+# (with a normal wireguard daemon on 127.0.0.1:51820 of the VPS)
+# =============================================================================
+
+# mode must be "off" or "wstunnel". Any other value is treated as off.
+mode = off
+
+[wstunnel]
+# Local UDP listener. wireproxy's [Peer] Endpoint must equal this.
+local-udp = 127.0.0.1:51820
+
+# Remote server. Options:
+#   wss://host:443   WebSocket over TLS (recommended, HTTPS-disguised)
+#   ws://host:port   plain WebSocket (only inside a trusted LAN)
+#   wqs://host:443   WebSocket over QUIC (better on very lossy networks)
+# remote = wss://your-server.com:443
+remote =
+
+# Optional basic auth. Both username and password must be set to enable.
+# username = myuser
+# password = mypassword
+
+# Optional: skip certificate verification (self-signed test only).
+# insecure = false

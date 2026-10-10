@@ -14,7 +14,13 @@ TNBINS := $(addprefix $(BIN)/,$(addsuffix /wstunnel,$(ARCHS)))
 WEBUI_DIR := $(ROOT_DIR)/webui
 WEBROOT := $(ROOT_DIR)/webroot
 
-.PHONY: build build-go build-rust webui webui-clean clean package verify help
+# Files that make up the distributable module zip.
+# NOTE: etc/wireproxy.conf and etc/tunnel.conf are deliberately absent —
+# they hold real keys. customize.sh seeds them from the examples (or keeps
+# the copy already on the device).
+PKG_FILES := module.prop customize.sh uninstall.sh sepolicy.rule service.sh wg-user common/ etc/wireproxy.conf.example etc/tunnel.conf.example webroot/ bin/arm64-v8a bin/armeabi-v7a bin/x86_64 bin/x86 scripts/cargo-wrappers/ README.md LICENSE docs/INSTALL.md docs/CONFIG.md docs/TUNNEL-SERVER.md docs/CHANGELOG.md docs/ARCHITECTURE.md
+
+.PHONY: build build-go build-rust webui webui-clean clean package package-only verify help
 
 help:
 	@echo "make build      - cross-compile wireproxy (Go) + wstunnel (Rust)"
@@ -42,9 +48,9 @@ $(BIN)/%/wstunnel:
 	    bash $(SCRIPTS)/cargo-cross.sh
 
 webui:
-	@echo "==> building Preact + Tailwind WebUI -> $(WEBROOT)..."
-	@cd $(WEBUI_DIR) && [ -d node_modules ] || npm install --no-fund --no-audit
-	@cd $(WEBUI_DIR) && npm run build
+	@echo "==> building Preact + TypeScript + Tailwind WebUI -> $(WEBROOT)..."
+	@cd $(WEBUI_DIR) && pnpm install --frozen-lockfile
+	@cd $(WEBUI_DIR) && pnpm run check
 
 webui-clean:
 	rm -f $(WEBROOT)/app.js $(WEBROOT)/index.html $(WEBROOT)/style.css
@@ -57,22 +63,17 @@ clean:
 package: build webui
 	@echo "==> packaging wg-user v$(VERSION)..."
 	@mkdir -p $(DIST)
-	@cd $(ROOT_DIR) && zip -r $(DIST)/wg-user-$(VERSION).zip \
-	    module.prop customize.sh uninstall.sh sepolicy.rule \
-	    service.sh wg-user common/ etc/ webroot/ \
-	    bin/arm64-v8a bin/armeabi-v7a bin/x86_64 bin/x86 \
-	    scripts/cargo-wrappers/ \
-	    README.md LICENSE \
-	    docs/INSTALL.md docs/CONFIG.md docs/TUNNEL-SERVER.md \
-	    docs/CHANGELOG.md docs/ARCHITECTURE.md 2>/dev/null || \
-	  (echo "zip not found, trying tar:" && tar czf $(DIST)/wg-user-$(VERSION).tar.gz \
-	    module.prop customize.sh uninstall.sh sepolicy.rule \
-	    service.sh wg-user common/ etc/ webroot/ \
-	    bin/arm64-v8a bin/armeabi-v7a bin/x86_64 bin/x86 \
-	    scripts/cargo-wrappers/ \
-	    README.md LICENSE \
-	    docs/INSTALL.md docs/CONFIG.md docs/TUNNEL-SERVER.md \
-	    docs/CHANGELOG.md docs/ARCHITECTURE.md)
+	@cd $(ROOT_DIR) && zip -r $(DIST)/wg-user-$(VERSION).zip $(PKG_FILES) 2>/dev/null || \
+	  (echo "zip not found, trying tar:" && tar czf $(DIST)/wg-user-$(VERSION).tar.gz $(PKG_FILES))
+	@ls -lh $(DIST)
+
+# Same archive, but without re-running the slow cross-compiles. Use after
+# touching only webui/ or docs/.
+package-only: webui
+	@echo "==> packaging wg-user v$(VERSION) (no rebuild)..."
+	@mkdir -p $(DIST)
+	@cd $(ROOT_DIR) && zip -r $(DIST)/wg-user-$(VERSION).zip $(PKG_FILES) 2>/dev/null || \
+	  (echo "zip not found, trying tar:" && tar czf $(DIST)/wg-user-$(VERSION).tar.gz $(PKG_FILES))
 	@ls -lh $(DIST)
 
 verify:

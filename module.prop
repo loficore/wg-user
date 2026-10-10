@@ -1,7 +1,7 @@
 id=wg-user
 name=wg-user — Userspace WireGuard Proxy
-version=0.1.0
-versionCode=1
+version=0.2.0
+versionCode=5
 author=wg-user contributors
 description=Auto-starts a userspace WireGuard client and exposes it as a SOCKS5/HTTP proxy on 127.0.0.1. No TUN device. Multi-arch, multi-root (KSU/Magisk/APatch). Optional wstunnel obfuscation for mobile. WebUI included.
 updateJson=

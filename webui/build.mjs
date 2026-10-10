@@ -34,7 +34,7 @@ async function bundle() {
     runTailwind();
     copyHtml();
     const opts = {
-        entryPoints: [resolve(SRC_DIR, 'src', 'main.jsx')],
+        entryPoints: [resolve(SRC_DIR, 'src', 'main.tsx')],
         bundle: true,
         minify: !isWatch,
         sourcemap: isWatch ? 'inline' : false,
@@ -42,7 +42,7 @@ async function bundle() {
         format: 'iife',
         jsx: 'automatic',
         jsxImportSource: 'preact',
-        loader: { '.js': 'jsx', '.jsx': 'jsx' },
+        loader: { '.ts': 'ts', '.tsx': 'tsx' },
         outfile: resolve(OUT_DIR, 'app.js'),
         logLevel: 'info',
         define: { 'process.env.NODE_ENV': isWatch ? '"development"' : '"production"' },

@@ -232,24 +232,39 @@ wstunnel server wss://0.0.0.0:443 --restrict-to 127.0.0.1:51820
 ## 8. WebUI design
 
 KSU exposes a WebView in which modules under `webroot/` are loaded. The page
-communicates with the daemon via the `ksu` global object:
+communicates with the daemon via the `ksu` global object. On KernelSU 3.x
+(the versions in the wild today) the bridge is:
 
-- `ksu.exec(cmd)` — run a shell command as root, returns stdout
-- `ksu.spawn(cmd)` — run async, returns a process handle
-- `ksu.readAssets(name)` — read a file from the module's `webroot/`
+- `ksu.exec(cmd)` — synchronous, but returns **only the last line** of output
+- `ksu.exec(cmd, optionsJson, callbackName)` — async; calls
+  `window[callbackName](exitCode, stdout, stderr)` with the **complete**
+  output. This is the overload the WebUI uses.
+- `ksu.spawn(cmd, ...)` — run async, returns a process handle
+- `ksu.toast(msg)` — a native toast
 - `ksu.moduleInfo` — module metadata
+
+`ksu.readAssets()` no longer exists; module files are read with
+`cat /data/adb/modules/wg-user/<file>` through `ksu.exec`.
 
 UI sections:
 
-- **Status**: green/red dot, last handshake time, transfer counters (read from
-  `wireproxy -i http://127.0.0.1:port` if enabled, or from parsing log).
-- **Controls**: Start / Stop / Restart / Reload buttons → `ksu.exec("wg-user ...")`
-- **Logs**: tail the log file via `ksu.exec("tail -n 50 log/wireproxy.log")`
-- **Config editor**: `<textarea>` populated via `ksu.readAssets('etc/wireproxy.conf')`,
-  saved via `ksu.exec('wg-user save-config')`. On save, watcher triggers reload.
+- **Status**: green/red dot plus a one-line summary, parsed from the text
+  of `wg-user status`.
+- **Controls**: Start / Stop / Restart / Reload buttons →
+  `ksu.exec('/data/adb/modules/wg-user/wg-user <cmd>')`
+- **Logs**: tail the log file via `ksu.exec('wg-user log 50')`
+- **Config editor**: `<textarea>` populated via
+  `cat /data/adb/modules/wg-user/etc/wireproxy.conf`, saved via
+  `wg-user save-config`. On save, the CLI reloads the daemon.
 
 The WebUI is **optional** — the module works without it. The CLI (`wg-user`)
 is the source of truth for the API surface; the WebUI is a thin shim.
+
+Sources live in `webui/` (Preact + TypeScript + Tailwind, bundled by
+esbuild, `pnpm run check` runs `tsc --noEmit` first). Strings are
+internationalised through `webui/src/i18n/` — `en.ts` is the source of
+truth for the key set, every other catalogue is typed against it, so a
+missing translation breaks the build.
 
 ## 9. Build & distribution
 

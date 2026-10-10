@@ -18,6 +18,32 @@ If you enable wstunnel in `tunnel.conf`, change `wireproxy.conf`'s
 `[Peer] Endpoint` to `127.0.0.1:51820` (matching `tunnel.conf`'s
 `local-udp`). wstunnel then forwards to the real server over TLS/443.
 
+`tunnel.conf` keys (flat parser, first match wins, no trailing comments):
+
+| key | default | meaning |
+|---|---|---|
+| `mode` | `off` | only `wstunnel` enables the tunnel |
+| `local-udp` | `127.0.0.1:51820` | where wstunnel listens for wireproxy on the phone |
+| `remote-udp` | `127.0.0.1:51820` | where the *server* forwards to (its own WG listener) |
+| `remote` | — | `wss://host:443`, `ws://host:port` or `wts://host:443` |
+| `username` / `password` | — | WebSocket upgrade basic auth (both required) |
+| `insecure` | `true` | `false` enables TLS certificate verification (wstunnel's default cert is self-signed) |
+
+## Reaching only the WireGuard subnet
+
+`[Peer] AllowedIPs` is the allowlist of destinations SOCKS5 clients may
+reach through the peer. For a "VPN-only" setup (no NAT on the server,
+no internet egress), narrow it:
+
+```ini
+[Peer]
+AllowedIPs = 10.66.0.0/24
+```
+
+Anything outside it is never put on the tunnel. Reaching the server's LAN
+(`192.168.1.0/24`) or the internet would additionally need NAT or a static
+route on the server side.
+
 ## Hot reload
 
 The module ships a background watcher (started by `service.sh`) that

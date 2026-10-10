@@ -2,7 +2,7 @@
 bin/*/wireproxy
 bin/*/wstunnel
 dist/
-src/
+/src/
 
 # User config (replace with real keys locally; never commit)
 etc/wireproxy.conf

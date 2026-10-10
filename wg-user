@@ -49,6 +49,20 @@ tunnel_remote_url() {
         '/^[[:space:]]*remote[[:space:]]*=/{print $2; exit}' "$TNCONF" 2>/dev/null
 }
 
+# Address the *server* forwards to (as seen from the server), e.g. its local
+# WireGuard listener. wstunnel v11's -L needs BIND:PORT:HOST:PORT, so the
+# client cannot infer this from local-udp.
+tunnel_remote_udp() {
+    awk -F'[[:space:]]*=[[:space:]]*' \
+        '/^[[:space:]]*remote-udp[[:space:]]*=/{print $2; exit}' "$TNCONF" 2>/dev/null
+}
+
+# insecure = true  -> leave wstunnel's default (certificate verification OFF)
+# insecure absent/false -> pass --tls-verify-certificate
+tunnel_verify_cert() {
+    grep -Eqi '^[[:space:]]*insecure[[:space:]]*=[[:space:]]*(false|no|0)' "$TNCONF" 2>/dev/null
+}
+
 tunnel_auth() {
     u=$(awk -F'[[:space:]]*=[[:space:]]*' '/^[[:space:]]*username[[:space:]]*=/{print $2; exit}' "$TNCONF" 2>/dev/null)
     p=$(awk -F'[[:space:]]*=[[:space:]]*' '/^[[:space:]]*password[[:space:]]*=/{print $2; exit}' "$TNCONF" 2>/dev/null)
@@ -56,6 +70,23 @@ tunnel_auth() {
 }
 
 # ---------- tunnel lifecycle ----------
+
+# spawn_tunnel <args...> — start wstunnel, wait a moment, return 0 if it stayed up.
+# A restart kills the old client and immediately starts a new one; the old
+# socket can still be bound for a few hundred ms, which makes the new client
+# exit at once. The caller retries after a short sleep.
+spawn_tunnel() {
+    nohup "$BINTN" "$@" > "$TNLOG" 2>&1 &
+    pid=$!
+    echo "$pid" > "$TNPIDFILE"
+    i=0
+    while [ $i -lt 5 ]; do
+        sleep 0.2
+        is_running "$TNPIDFILE" || return 1
+        i=$((i + 1))
+    done
+    return 0
+}
 
 cmd_tunnel_start() {
     if ! tunnel_enabled; then
@@ -77,30 +108,31 @@ cmd_tunnel_start() {
         return 1
     fi
     auth=$(tunnel_auth)
+    remote_udp=$(tunnel_remote_udp); remote_udp=${remote_udp:-127.0.0.1:51820}
 
-    log_info "starting wstunnel: $local_addr <-> $remote_url"
-    # shellcheck disable=SC2086
-    nohup "$BINTN" client \
-        -L "udp://$local_addr" \
-        -F "$remote_url" \
-        ${auth:+--ws-auth "$auth"} \
-        > "$TNLOG" 2>&1 &
-    pid=$!
-    echo "$pid" > "$TNPIDFILE"
+    verify=""
+    if tunnel_verify_cert; then verify="--tls-verify-certificate"; fi
 
-    # Wait for the local UDP listener to be reachable. /dev/udp is bash/ksh
-    # only; on busybox it's missing — fall back to a short sleep loop and
-    # check the process is still alive.
-    i=0
-    while [ $i -lt 25 ]; do
-        sleep 0.2
-        if ! is_running "$TNPIDFILE"; then break; fi
-        i=$((i + 1))
-    done
-    if ! is_running "$TNPIDFILE"; then
-        log_err "wstunnel exited immediately. Last log:"
-        tail -n 20 "$TNLOG" >&2
-        return 1
+    # wstunnel v11 syntax:
+    #   - the server URL is a POSITIONAL argument (there is no -F)
+    #   - -L is  udp://[BIND:]PORT:HOST:PORT
+    #   - timeout_sec=0 disables the default 30s idle teardown, which would
+    #     otherwise kill the WireGuard session
+    #   - basic auth for the upgrade request is --http-upgrade-credentials
+    log_info "starting wstunnel: udp/$local_addr -> ($remote_url) -> $remote_udp"
+    set -- client -L "udp://$local_addr:$remote_udp?timeout_sec=0"
+    if [ -n "$verify" ]; then set -- "$@" "$verify"; fi
+    if [ -n "$auth" ]; then set -- "$@" --http-upgrade-credentials "$auth"; fi
+    set -- "$@" "$remote_url"
+
+    if ! spawn_tunnel "$@"; then
+        log_warn "wstunnel exited right after start; retrying once in 1s"
+        sleep 1
+        if ! spawn_tunnel "$@"; then
+            log_err "wstunnel failed to start twice. Last log:"
+            tail -n 20 "$TNLOG" >&2
+            return 1
+        fi
     fi
     log_info "tunnel started (pid $pid) on udp/$local_addr"
 }

@@ -47,23 +47,26 @@ the full reference.
 
 ## WebUI
 
-The module ships a Preact + Tailwind WebUI. Open the module in your
-root manager's Modules list. Status, controls, log, and config editor
-are all available from the WebUI; the CLI (`wg-user ...`) is always
-the source of truth for the API surface.
+The module ships a Preact + TypeScript + Tailwind WebUI (bilingual:
+English / 中文, switchable in the header). Open the module in your root
+manager's Modules list. Status, controls, log, and config editor are all
+available from the WebUI; the CLI (`wg-user ...`) is always the source
+of truth for the API surface.
 
 ## Build from source
 
 ```bash
-make build      # cross-compile wireproxy (Go) + wstunnel (Rust) for 4 archs
-make webui      # rebuild the WebUI (needs node; optional)
-make package    # zip for distribution
+make build       # cross-compile wireproxy (Go) + wstunnel (Rust) for 4 archs
+make webui       # rebuild the WebUI (pnpm + tsc + esbuild + tailwind)
+make package     # zip for distribution
+make package-only  # re-zip without the slow cross-compiles
 ```
 
 Requires:
 - Go 1.21+ (for wireproxy)
 - Rust 1.7x+ + rustup + 4 Android targets + Android NDK r26+ (for wstunnel)
-- Node 18+ (for `make webui`, optional)
+- Node 26+ and pnpm 11+ (for `make webui`; versions are pinned in
+  `.tool-versions` for asdf and `webui/packageManager`)
 - `zip` (or the build falls back to `tar.gz`)
 
 The Go build uses `GOPROXY=https://goproxy.cn,direct` by default — override

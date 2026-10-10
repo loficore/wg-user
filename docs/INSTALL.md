@@ -26,11 +26,20 @@ make package    # produce dist/wg-user-<version>.zip
 - Rust 1.7x+ with rustup + the 4 Android targets (for wstunnel)
 - Android NDK r26+ (NDK clang wrappers in `scripts/cargo-wrappers/`)
 
-`make webui` is opt-in (rebuilds the Preact+Tailwind WebUI; needs Node 18+).
+`make webui` rebuilds the WebUI (Preact + TypeScript + Tailwind via
+pnpm/esbuild). It is part of `make package`; needs Node 26+ and pnpm 11+
+(pinned in `.tool-versions`). `make package-only` re-zips without the slow
+cross-compiles.
 
 Then flash the zip as above.
 
 ## Post-install
+
+The zip ships only `etc/wireproxy.conf.example` and `etc/tunnel.conf.example`.
+A real config contains your WireGuard private key, so it is never packaged.
+On install, `customize.sh` keeps an existing `etc/*.conf` (upgrade) or copies
+the example into place (fresh install); either way you must fill in your own
+keys.
 
 1. Edit `etc/wireproxy.conf` with your real WG keys/endpoint. On device:
    ```sh
@@ -75,10 +84,14 @@ After install, verify each of these:
 
 ## KSU WebUI compatibility note
 
-The bundled `webroot/app.js` auto-detects the KSU WebView API style
-(callback vs Promise). If you have an old KSU where both fail, the
-buttons will show "ksu.exec unavailable" in the console — the CLI
-(`wg-user ...`) is always available as a fallback.
+Verified against KernelSU manager **v3.3.1** (`me.weishu.kernelsu`). The
+bridge tries, in order: the 3-argument `exec(cmd, '{}', cb)` (complete
+stdout/stderr — the one KSU 3.x needs), the synchronous one-argument
+`exec(cmd)` (older builds, last line only), and the very old
+`exec(cmd, cb)` form. If none answer within 30 s the card shows
+`ksu bridge timeout` instead of hanging on "checking…".
+
+The CLI (`wg-user ...`) is always available as a fallback.
 
 ## Uninstall
 

@@ -68,4 +68,58 @@ fi
 select_wstunnel_binary "$MODPATH" "$MODPATH/bin/wstunnel" 2>/dev/null \
     || log_warn "wstunnel not bundled; tunnel mode will be unavailable"
 
+# ---------------------------------------------------------------------------
+# Restore the executable bits.
+#
+# KernelSU's ksud extracts the zip without applying the Unix mode stored in
+# the archive, so every file lands as 0644. service.sh is then exec'd at boot
+# and dies with "can't execute: Permission denied", and wg-user cannot be
+# invoked from service.sh either. The module then never starts, with no log
+# to explain it.
+#
+# chmod (not the installer's set_perm helper) so this also works under Magisk,
+# APatch and a manual . customize.sh run.
+# ---------------------------------------------------------------------------
+fix_mode() {
+    [ -e "$1" ] || return 0
+    chown 0:0 "$1" 2>/dev/null || true
+    chmod "$2" "$1" 2>/dev/null || true
+}
+
+for f in wg-user service.sh customize.sh uninstall.sh; do
+    fix_mode "$MODPATH/$f" 0755
+done
+[ -d "$MODPATH/bin" ] && chmod -R 0755 "$MODPATH/bin" 2>/dev/null
+
+trace "permissions: $(ls -l "$MODPATH/service.sh" 2>/dev/null | awk '{print $1}') service.sh"
+
+# ---------------------------------------------------------------------------
+# Config handling.
+#
+# The distributable zip intentionally carries only the *.example configs —
+# a real one contains WireGuard private keys and a server address. On
+# reinstall we keep whatever the device already has; on a fresh install we
+# seed from the example so the module has a parseable file to start from.
+# ---------------------------------------------------------------------------
+seed_config() {
+    name="$1"
+    [ -f "$MODPATH/etc/$name" ] && return 0
+    if [ -f "/data/adb/modules/wg-user/etc/$name" ]; then
+        cp -f "/data/adb/modules/wg-user/etc/$name" "$MODPATH/etc/$name" 2>/dev/null \
+            && log_info "kept existing etc/$name" \
+            && return 0
+    fi
+    if [ -f "$MODPATH/etc/$name.example" ]; then
+        cp -f "$MODPATH/etc/$name.example" "$MODPATH/etc/$name" 2>/dev/null \
+            && log_warn "no existing etc/$name — seeded from the example; edit it before use"
+    fi
+}
+
+mkdir -p "$MODPATH/etc" 2>/dev/null
+seed_config wireproxy.conf
+seed_config tunnel.conf
+[ -d "$MODPATH/etc" ] && chmod 0700 "$MODPATH/etc" 2>/dev/null
+[ -f "$MODPATH/etc/wireproxy.conf" ] && chmod 0600 "$MODPATH/etc/wireproxy.conf" 2>/dev/null
+[ -f "$MODPATH/etc/tunnel.conf" ] && chmod 0600 "$MODPATH/etc/tunnel.conf" 2>/dev/null
+
 log_info "Installed binaries for $(getprop ro.product.cpu.abi)"

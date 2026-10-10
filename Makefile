@@ -11,13 +11,16 @@ VERSION  := $(shell grep '^version=' $(ROOT_DIR)/module.prop | cut -d= -f2)
 ARCHS := arm64-v8a armeabi-v7a x86_64 x86
 WPBINS := $(addprefix $(BIN)/,$(addsuffix /wireproxy,$(ARCHS)))
 TNBINS := $(addprefix $(BIN)/,$(addsuffix /wstunnel,$(ARCHS)))
+WEBUI_DIR := $(ROOT_DIR)/webui
+WEBROOT := $(ROOT_DIR)/webroot
 
-.PHONY: build build-go build-rust clean package verify help
+.PHONY: build build-go build-rust webui webui-clean clean package verify help
 
 help:
 	@echo "make build      - cross-compile wireproxy (Go) + wstunnel (Rust)"
 	@echo "make build-go   - only wireproxy (faster, ~3 min)"
 	@echo "make build-rust - only wstunnel (~5 min; needs NDK + rustup targets)"
+	@echo "make webui      - rebuild the Preact+Tailwind KSU WebUI (needs node)"
 	@echo "make clean      - remove build artifacts"
 	@echo "make package    - zip the module for distribution (after build)"
 	@echo "make verify     - run syntax/static checks and configtest"
@@ -38,11 +41,20 @@ $(BIN)/%/wstunnel:
 	WSTUNNEL_VERSION=$${WSTUNNEL_VERSION:-v11.0.0} \
 	    bash $(SCRIPTS)/cargo-cross.sh
 
+webui:
+	@echo "==> building Preact + Tailwind WebUI -> $(WEBROOT)..."
+	@cd $(WEBUI_DIR) && [ -d node_modules ] || npm install --no-fund --no-audit
+	@cd $(WEBUI_DIR) && npm run build
+
+webui-clean:
+	rm -f $(WEBROOT)/app.js $(WEBROOT)/index.html $(WEBROOT)/style.css
+
 clean:
 	rm -rf $(BIN)/*/wireproxy $(BIN)/*/wstunnel
 	rm -rf $(DIST)
+	$(MAKE) webui-clean
 
-package: build
+package: build webui
 	@echo "==> packaging wg-user v$(VERSION)..."
 	@mkdir -p $(DIST)
 	@cd $(ROOT_DIR) && zip -r $(DIST)/wg-user-$(VERSION).zip \

@@ -1,0 +1,6 @@
+id=wg-user
+name=wg-user
+version=0.1.0
+versionCode=1
+author=wg-user contributors
+description=Userspace WireGuard proxy module

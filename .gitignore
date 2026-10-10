@@ -15,3 +15,6 @@ etc/tunnel.conf
 
 # SDD workspace (executing-plans skill scratch; never commit)
 .superpowers/
+
+# WebUI dev
+webui/node_modules/

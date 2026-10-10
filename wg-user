@@ -1,0 +1,290 @@
+#!/system/bin/sh
+# wg-user — control script for the WireGuard userspace proxy module.
+#
+# Top-level subcommands:
+#   start                  — start wstunnel (if enabled) then wireproxy
+#   stop                   — stop wireproxy then wstunnel
+#   restart                — stop + start
+#   reload                 — configtest; on success, stop+start
+#   status                 — print status of wireproxy + tunnel
+#   log [daemon] [N]       — tail N lines of wireproxy.log or wstunnel.log
+#   save-config <path>     — copy file to wireproxy.conf; triggers reload
+#   version                — module version
+#
+#   tunnel start|stop|status|restart   — sub-namespace for wstunnel
+#
+# All subcommands exit 0 on success, 1 on error.
+
+set -eu
+
+SELF="$0"
+ROOT="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+. "$ROOT/common/util.sh"
+. "$ROOT/common/abi.sh"
+
+WPPIDFILE="$ROOT/run/wireproxy.pid"
+TNPIDFILE="$ROOT/run/wstunnel.pid"
+WPLOG="$ROOT/log/wireproxy.log"
+TNLOG="$ROOT/log/wstunnel.log"
+WPCONF="$ROOT/etc/wireproxy.conf"
+TNCONF="$ROOT/etc/tunnel.conf"
+BINWP="$ROOT/bin/wireproxy"
+BINTN="$ROOT/bin/wstunnel"
+mkdir -p "$ROOT/run" "$ROOT/log"
+
+# ---------- tunnel config helpers ----------
+
+tunnel_enabled() {
+    [ -f "$TNCONF" ] || return 1
+    grep -Eq '^[[:space:]]*mode[[:space:]]*=[[:space:]]*(wstunnel)' "$TNCONF"
+}
+
+tunnel_local_addr() {
+    awk -F'[[:space:]]*=[[:space:]]*' \
+        '/^[[:space:]]*local-udp[[:space:]]*=/{print $2; exit}' "$TNCONF" 2>/dev/null
+}
+
+tunnel_remote_url() {
+    awk -F'[[:space:]]*=[[:space:]]*' \
+        '/^[[:space:]]*remote[[:space:]]*=/{print $2; exit}' "$TNCONF" 2>/dev/null
+}
+
+tunnel_auth() {
+    u=$(awk -F'[[:space:]]*=[[:space:]]*' '/^[[:space:]]*username[[:space:]]*=/{print $2; exit}' "$TNCONF" 2>/dev/null)
+    p=$(awk -F'[[:space:]]*=[[:space:]]*' '/^[[:space:]]*password[[:space:]]*=/{print $2; exit}' "$TNCONF" 2>/dev/null)
+    if [ -n "$u" ] && [ -n "$p" ]; then echo "$u:$p"; fi
+}
+
+# ---------- tunnel lifecycle ----------
+
+cmd_tunnel_start() {
+    if ! tunnel_enabled; then
+        log_info "tunnel disabled in $TNCONF (mode = off)"
+        return 0
+    fi
+    if [ ! -x "$BINTN" ]; then
+        log_err "tunnel enabled but wstunnel binary missing: $BINTN"
+        return 1
+    fi
+    if is_running "$TNPIDFILE"; then
+        log_info "tunnel already running (pid $(cat "$TNPIDFILE"))"
+        return 0
+    fi
+    local_addr=$(tunnel_local_addr); local_addr=${local_addr:-127.0.0.1:51820}
+    remote_url=$(tunnel_remote_url)
+    if [ -z "$remote_url" ]; then
+        log_err "$TNCONF: missing 'remote' URL (e.g. wss://server:443)"
+        return 1
+    fi
+    auth=$(tunnel_auth)
+
+    log_info "starting wstunnel: $local_addr <-> $remote_url"
+    # shellcheck disable=SC2086
+    nohup "$BINTN" client \
+        -L "udp://$local_addr" \
+        -F "$remote_url" \
+        ${auth:+--ws-auth "$auth"} \
+        > "$TNLOG" 2>&1 &
+    pid=$!
+    echo "$pid" > "$TNPIDFILE"
+
+    # Wait for the local UDP listener to be reachable. /dev/udp is bash/ksh
+    # only; on busybox it's missing — fall back to a short sleep loop and
+    # check the process is still alive.
+    i=0
+    while [ $i -lt 25 ]; do
+        sleep 0.2
+        if ! is_running "$TNPIDFILE"; then break; fi
+        i=$((i + 1))
+    done
+    if ! is_running "$TNPIDFILE"; then
+        log_err "wstunnel exited immediately. Last log:"
+        tail -n 20 "$TNLOG" >&2
+        return 1
+    fi
+    log_info "tunnel started (pid $pid) on udp/$local_addr"
+}
+
+cmd_tunnel_stop() {
+    if ! is_running "$TNPIDFILE"; then
+        rm -f "$TNPIDFILE"
+        log_info "tunnel not running"
+        return 0
+    fi
+    pid=$(cat "$TNPIDFILE")
+    log_info "stopping wstunnel (pid $pid)..."
+    kill -INT "$pid" 2>/dev/null || true
+    i=0
+    while [ $i -lt 30 ] && kill -0 "$pid" 2>/dev/null; do
+        sleep 0.1
+        i=$((i + 1))
+    done
+    kill -0 "$pid" 2>/dev/null && kill -TERM "$pid" 2>/dev/null || true
+    rm -f "$TNPIDFILE"
+    log_info "tunnel stopped"
+}
+
+cmd_tunnel_status() {
+    if ! tunnel_enabled; then
+        echo "tunnel: disabled"
+        return 0
+    fi
+    if is_running "$TNPIDFILE"; then
+        echo "tunnel: running (pid $(cat "$TNPIDFILE"))"
+    else
+        echo "tunnel: stopped"
+        return 1
+    fi
+}
+
+# ---------- wireproxy lifecycle ----------
+
+cmd_start() {
+    # Order matters: tunnel first, then wireproxy.
+    cmd_tunnel_start || { log_err "tunnel failed to start; aborting"; return 1; }
+
+    if is_running "$WPPIDFILE"; then
+        log_info "wireproxy already running (pid $(cat "$WPPIDFILE"))"
+        return 0
+    fi
+    if [ ! -x "$BINWP" ]; then
+        log_err "binary not installed: $BINWP. Run 'customize.sh' or 'install.sh'."
+        return 1
+    fi
+    if [ ! -f "$WPCONF" ]; then
+        log_err "config not found: $WPCONF"
+        return 1
+    fi
+
+    log_info "starting wireproxy..."
+    nohup "$BINWP" -c "$WPCONF" > "$WPLOG" 2>&1 &
+    pid=$!
+    echo "$pid" > "$WPPIDFILE"
+
+    if [ -e "/proc/$pid/oom_score_adj" ]; then
+        echo -1000 > "/proc/$pid/oom_score_adj" 2>/dev/null \
+            && log_info "set oom_score_adj=-1000" \
+            || log_warn "could not set oom_score_adj (non-fatal)"
+    fi
+
+    sleep 1
+    if ! is_running "$WPPIDFILE"; then
+        log_err "wireproxy exited immediately. Last log:"
+        tail -n 20 "$WPLOG" >&2
+        return 1
+    fi
+    log_info "wireproxy started (pid $pid). Logs: $WPLOG"
+}
+
+cmd_stop() {
+    if is_running "$WPPIDFILE"; then
+        pid=$(cat "$WPPIDFILE")
+        log_info "stopping wireproxy (pid $pid)..."
+        kill -INT "$pid" 2>/dev/null || true
+        i=0
+        while [ $i -lt 50 ] && kill -0 "$pid" 2>/dev/null; do
+            sleep 0.1
+            i=$((i + 1))
+        done
+        kill -0 "$pid" 2>/dev/null && kill -TERM "$pid" 2>/dev/null || true
+        rm -f "$WPPIDFILE"
+        log_info "wireproxy stopped"
+    else
+        rm -f "$WPPIDFILE"
+        log_info "wireproxy not running"
+    fi
+    # Stop the tunnel after wireproxy so the WG handshake errors don't pile up.
+    cmd_tunnel_stop
+}
+
+cmd_restart() {
+    cmd_stop
+    cmd_start
+}
+
+cmd_reload() {
+    if [ ! -f "$WPCONF" ]; then
+        log_err "no config at $WPCONF"
+        return 1
+    fi
+    log_info "configtest $WPCONF"
+    if ! "$BINWP" -n -c "$WPCONF"; then
+        log_err "configtest FAILED; not reloading. See $WPLOG for details."
+        return 1
+    fi
+    log_info "config OK; restarting"
+    cmd_restart
+}
+
+cmd_status() {
+    rc=0
+    if is_running "$WPPIDFILE"; then
+        pid=$(cat "$WPPIDFILE")
+        log_info "wireproxy: running (pid $pid)"
+        [ -f "$WPLOG" ] && log_info "last log: $(tail -n1 "$WPLOG")"
+    else
+        log_info "wireproxy: stopped"
+        rc=1
+    fi
+    cmd_tunnel_status || rc=$?
+    return $rc
+}
+
+cmd_log() {
+    target="${1:-wireproxy}"
+    n="${2:-50}"
+    case "$target" in
+        wireproxy|wp) f="$WPLOG" ;;
+        tunnel|tn)     f="$TNLOG" ;;
+        *) log_err "log: unknown target '$target' (use 'wireproxy' or 'tunnel')"; return 1 ;;
+    esac
+    [ -f "$f" ] || { log_err "no log: $f"; return 1; }
+    tail -n "$n" "$f"
+}
+
+cmd_save_config() {
+    src="$1"
+    [ -n "$src" ] && [ -f "$src" ] || { log_err "save-config: file not found: $src"; return 1; }
+    cp -f "$src" "$WPCONF"
+    log_info "saved config to $WPCONF"
+    cmd_reload
+}
+
+cmd_version() {
+    grep '^version=' "$ROOT/module.prop" | cut -d= -f2
+}
+
+usage() {
+    sed -n '2,/^$/p' "$0" | head -n 40 | sed 's/^# \{0,1\}//'
+    # Return 0 so `set -e` does not abort before the caller's explicit
+    # exit code is honored (e.g. `usage; exit 0` for --help).
+    return 0
+}
+
+# ---------- dispatcher ----------
+
+# Handle the "tunnel" sub-namespace explicitly so the dispatcher stays flat.
+if [ "${1:-}" = "tunnel" ]; then
+    shift
+    case "${1:-}" in
+        start)   cmd_tunnel_start ;;
+        stop)    cmd_tunnel_stop ;;
+        status)  cmd_tunnel_status ;;
+        restart) cmd_tunnel_stop; cmd_tunnel_start ;;
+        *)       log_err "tunnel: unknown subcommand: $1"; usage; exit 1 ;;
+    esac
+    exit $?
+fi
+
+case "${1:-}" in
+    start)        cmd_start ;;
+    stop)         cmd_stop ;;
+    restart)      cmd_restart ;;
+    reload)       cmd_reload ;;
+    status)       cmd_status ;;
+    log)          shift; cmd_log "$@" ;;
+    save-config)  shift; cmd_save_config "$@" ;;
+    version)      cmd_version ;;
+    ""|-h|--help|help) usage; exit 0 ;;
+    *) log_err "unknown subcommand: $1"; usage; exit 1 ;;
+esac

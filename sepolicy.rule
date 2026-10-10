@@ -1,0 +1,6 @@
+# wg-user: SELinux policy rules
+# Currently empty. wireproxy runs entirely in userspace (no /dev/net/tun access)
+# and uses standard UDP sockets, which are permitted by init context.
+#
+# If you encounter SELinux denials in logcat for the wireproxy process,
+# add the minimal `allow <domain> <target>:<class> { <perms> };` lines here.

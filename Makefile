@@ -59,16 +59,20 @@ package: build webui
 	@mkdir -p $(DIST)
 	@cd $(ROOT_DIR) && zip -r $(DIST)/wg-user-$(VERSION).zip \
 	    module.prop customize.sh install.sh uninstall.sh sepolicy.rule \
-	    service.sh wg-user common/ etc/ webroot/ docs/ \
+	    service.sh wg-user common/ etc/ webroot/ \
 	    bin/arm64-v8a bin/armeabi-v7a bin/x86_64 bin/x86 \
 	    scripts/cargo-wrappers/ \
-	    README.md LICENSE 2>/dev/null || \
+	    README.md LICENSE \
+	    docs/INSTALL.md docs/CONFIG.md docs/TUNNEL-SERVER.md \
+	    docs/CHANGELOG.md docs/ARCHITECTURE.md 2>/dev/null || \
 	  (echo "zip not found, trying tar:" && tar czf $(DIST)/wg-user-$(VERSION).tar.gz \
 	    module.prop customize.sh install.sh uninstall.sh sepolicy.rule \
-	    service.sh wg-user common/ etc/ webroot/ docs/ \
+	    service.sh wg-user common/ etc/ webroot/ \
 	    bin/arm64-v8a bin/armeabi-v7a bin/x86_64 bin/x86 \
 	    scripts/cargo-wrappers/ \
-	    README.md LICENSE)
+	    README.md LICENSE \
+	    docs/INSTALL.md docs/CONFIG.md docs/TUNNEL-SERVER.md \
+	    docs/CHANGELOG.md docs/ARCHITECTURE.md)
 	@ls -lh $(DIST)
 
 verify:

@@ -1,8 +1,8 @@
 #!/system/bin/sh
-# wg-user install-time hook (KernelSU / Magisk, "modern" customize.sh path).
+# wg-user install-time hook (KernelSU / Magisk "modern" customize.sh path).
 #
 # IMPORTANT — do NOT add an install.sh to this module. Both KernelSU and
-# Magisk treat the PRESENCE of install.sh as a "legacy module":
+# Magisk treat the presence of install.sh as a "legacy module":
 #
 #   if is_legacy_script; then                     # install.sh exists
 #       unzip -oj "$ZIPFILE" module.prop install.sh uninstall.sh \
@@ -17,31 +17,38 @@
 # all of those, so it uses the modern customize.sh path exclusively.
 #
 # In the modern path the following are guaranteed:
-#   - $0 is the absolute path to this script  ($MODPATH/customize.sh)
-#   - $MODPATH is the module root              (/data/adb/modules_update/<id>)
-#   - every file from the zip is already at    $MODPATH/<path>
-#   - we are sourced, not exec'd, so `set -e` still applies (fine).
-set -e
+#   - MODPATH is exported by the installer (e.g. /data/adb/modules_update/<id>)
+#   - every file from the zip is already at $MODPATH/<path>
+#   - we are sourced, not exec'd, so errexit would propagate to the parent
+#
+# CRITICAL: do NOT use `set -e` here. Sourced scripts share the parent
+# shell; enabling errexit would cause the parent installer to abort on
+# the first non-zero command (e.g. its own `rmdir -p $MODPATH` against
+# the non-empty module dir). Verified by simulation: case A (with set -e)
+# exits 1 after a non-zero rmdir; case B (without) exits 0. Handle errors
+# explicitly with explicit checks instead.
 
 trace() { printf 'wg-user install: %s\n' "$*" >&2; }
 
-# Resolve the module root. In the modern path $0 is already absolute; prefer
-# it (a script can never lie about its own path when executed with one).
+# Resolve the module root. In the modern path the installer exports
+# MODPATH. (When sourced, $0 is the parent shell's name — NOT the script
+# path — so the $0 absolute-path branch is just a defensive fallback.)
 MODPATH="${MODPATH:-}"
-case "$0" in
-    /*)
-        cand="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
-        [ -f "$cand/module.prop" ] && MODPATH="$cand"
-        ;;
-esac
-# Fall back to PWD — the modern installer cd's nowhere, but some future
-# variant might.
 if [ -z "$MODPATH" ] || [ ! -f "$MODPATH/module.prop" ]; then
-    MODPATH="$(pwd)"
+    case "$0" in
+        /*)
+            cand="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+            [ -f "$cand/module.prop" ] && MODPATH="$cand"
+            ;;
+    esac
 fi
+[ -n "$MODPATH" ] || MODPATH="$(pwd)"
+
 if [ ! -f "$MODPATH/module.prop" ]; then
     trace "FATAL: cannot locate module root"
-    trace "  \$0='$0' MODPATH='${MODPATH:-}' pwd='$(pwd)'"
+    trace "  MODPATH='${MODPATH:-}' \$0='$0' pwd='$(pwd)'"
+    # `exit` from a sourced script terminates the parent installer; that
+    # is the right behaviour for an unrecoverable error.
     exit 1
 fi
 
@@ -51,7 +58,14 @@ trace "module root: $MODPATH"
 . "$MODPATH/common/util.sh"
 . "$MODPATH/common/abi.sh"
 
-select_wireproxy_binary "$MODPATH" "$MODPATH/bin/wireproxy"
+# Wireproxy is required; failure is fatal.
+if ! select_wireproxy_binary "$MODPATH" "$MODPATH/bin/wireproxy"; then
+    log_err "failed to select wireproxy binary"
+    exit 1
+fi
+
+# Wstunnel is optional (only needed if the user enables tunnel mode).
 select_wstunnel_binary "$MODPATH" "$MODPATH/bin/wstunnel" 2>/dev/null \
     || log_warn "wstunnel not bundled; tunnel mode will be unavailable"
+
 log_info "Installed binaries for $(getprop ro.product.cpu.abi)"

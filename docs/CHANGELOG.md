@@ -23,6 +23,17 @@ All notable changes to this project are documented here.
   (WebSocket-over-TLS on 443). Disabled by default; enable in
   `etc/tunnel.conf`.
 
+### Fixed
+- `install.sh` / `customize.sh` / `uninstall.sh`: resolve the module root
+  from `$MODPATH` / `$MODDIR`, falling back to `$PWD`, instead of
+  `${0%/*}`. The installer sources these scripts (`. ./install.sh`), so
+  `$0` is the shell name (`sh`) and `${0%/*}` returned `sh`, making the
+  `. "$sh/common/util.sh"` source line fail with
+  "can't open 'sh/common/util.sh'". (Reported by the first device install.)
+- `install.sh` / `customize.sh`: use `log_info`, not `log` — the shared
+  `common/util.sh` defines `log_info` / `log_warn` / `log_err`, and an
+  undefined `log` aborted the install (with `set -e`) at the last line.
+
 ### Known limitations
 - SOCKS5 UDP ASSOCIATE not supported (upstream wireproxy limitation).
 - WebUI save-config uses base64 staging via `/sdcard` (one extra disk

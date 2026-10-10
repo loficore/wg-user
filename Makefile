@@ -58,7 +58,7 @@ package: build webui
 	@echo "==> packaging wg-user v$(VERSION)..."
 	@mkdir -p $(DIST)
 	@cd $(ROOT_DIR) && zip -r $(DIST)/wg-user-$(VERSION).zip \
-	    module.prop customize.sh install.sh uninstall.sh sepolicy.rule \
+	    module.prop customize.sh uninstall.sh sepolicy.rule \
 	    service.sh wg-user common/ etc/ webroot/ \
 	    bin/arm64-v8a bin/armeabi-v7a bin/x86_64 bin/x86 \
 	    scripts/cargo-wrappers/ \
@@ -66,7 +66,7 @@ package: build webui
 	    docs/INSTALL.md docs/CONFIG.md docs/TUNNEL-SERVER.md \
 	    docs/CHANGELOG.md docs/ARCHITECTURE.md 2>/dev/null || \
 	  (echo "zip not found, trying tar:" && tar czf $(DIST)/wg-user-$(VERSION).tar.gz \
-	    module.prop customize.sh install.sh uninstall.sh sepolicy.rule \
+	    module.prop customize.sh uninstall.sh sepolicy.rule \
 	    service.sh wg-user common/ etc/ webroot/ \
 	    bin/arm64-v8a bin/armeabi-v7a bin/x86_64 bin/x86 \
 	    scripts/cargo-wrappers/ \
@@ -78,7 +78,7 @@ package: build webui
 verify:
 	@echo "==> sh -n syntax checks..."
 	@ok=0; fail=0; \
-	for f in customize.sh install.sh uninstall.sh service.sh wg-user scripts/*.sh common/*.sh; do \
+	for f in customize.sh uninstall.sh service.sh wg-user scripts/*.sh common/*.sh; do \
 	    if [ -f "$$f" ]; then \
 	        if sh -n "$$f" 2>/dev/null; then \
 	            echo "  ok: $$f"; ok=$$((ok+1)); \

@@ -111,14 +111,21 @@ verify:
 # Fetch commands are inline (not a download target) because this is a manual,
 # local-only step. Note the asset name: v11.0.0 names its Linux x86_64 build
 # wstunnel_11.0.0_linux_amd64.tar.gz (the older wstunnel-v11.0.0-x86_64-... form
-# 404s), and the tarball stores the binary without the exec bit, hence chmod.
+# 404s), the tarball stores the binary without the exec bit (hence chmod), and
+# the checksum is the verified SHA-256 of that tarball.
+#
+# -count=1 is required: the test cache does not see the server binary (it is
+# exec'd, not read through the instrumented file APIs) and WSTUNNEL_SERVER_BIN
+# keeps the same path when the pinned server is swapped, so a cached PASS would
+# defeat exactly the drift check this target exists to be.
 interop:
 	@if [ ! -x "$${WSTUNNEL_SERVER_BIN:-$(BIN)/interop/wstunnel}" ]; then \
 	    echo "missing wstunnel v11.0.0 server binary ($${WSTUNNEL_SERVER_BIN:-$(BIN)/interop/wstunnel}); fetch it with:"; \
 	    echo "  mkdir -p $(BIN)/interop && curl -fsSL -o /tmp/wstunnel.tar.gz \\"; \
 	    echo "    https://github.com/erebe/wstunnel/releases/download/v11.0.0/wstunnel_11.0.0_linux_amd64.tar.gz"; \
+	    echo "  echo '9708a99717b5a951453c2ff7c14c25d3418d02ca7fcb96fdb382a8f2083bab5e  /tmp/wstunnel.tar.gz' | sha256sum -c -"; \
 	    echo "  tar -xzf /tmp/wstunnel.tar.gz -C $(BIN)/interop wstunnel && chmod +x $(BIN)/interop/wstunnel"; \
 	    exit 1; \
 	fi
 	@WSTUNNEL_SERVER_BIN=$${WSTUNNEL_SERVER_BIN:-$(BIN)/interop/wstunnel} \
-	    go test -tags interop ./internal/wstunnel -run Interop -v
+	    go test -tags interop ./internal/wstunnel -run Interop -v -count=1

@@ -75,13 +75,23 @@ type interopServer struct {
 // startInteropServer launches the real server with the given --restrict-to
 // destination and returns once it accepts TCP connections on its port.
 //
-// --websocket-mask-frame is mandatory for this client, not cosmetic: gorilla
-// masks every client frame as RFC 6455 requires, and wstunnel 11 only unmasks
-// incoming frames when this flag is set (fastwebsockets' ReadHalf unmasks iff
-// role == Server && auto_apply_mask). Without it the server forwards the
-// still-masked payload to UDP and every datagram arrives XORed with the 4-byte
-// WebSocket mask key. The flag only changes the client-to-server direction;
-// the server never masks its own frames, so gorilla accepts the replies.
+// Two flags are load-bearing for this test, not cosmetic:
+//
+//   - --websocket-mask-frame: gorilla masks every client frame as RFC 6455
+//     requires, and wstunnel 11 only unmasks incoming frames when this flag is
+//     set (fastwebsockets' ReadHalf unmasks iff role == Server &&
+//     auto_apply_mask). Without it the server forwards the still-masked payload
+//     to UDP and every datagram arrives XORed with the 4-byte WebSocket mask
+//     key: the handshake still succeeds, so this is a silent data-plane failure.
+//     The flag only changes the client-to-server direction; the server never
+//     masks its own frames, so gorilla accepts the replies.
+//   - --restrict-http-upgrade-path-prefix v1: without it the server accepts any
+//     upgrade path, and a client-side path regression would still pass every
+//     interop test. With it, the upgrade path is part of the test instead of an
+//     assumption. The value is "v1", not "/v1/events": extract_path_prefix
+//     splits "/v1/events" into the prefix "v1" plus the "events" suffix and the
+//     restriction matches the prefix exactly (a regex ^v1$ on that segment), so
+//     "/v1/events" here would match nothing and reject every tunnel.
 //
 // The port is picked by binding 127.0.0.1:0 and closing the listener, which
 // leaves a small window in which somebody else could take it; if the server
@@ -98,6 +108,7 @@ func startInteropServer(t *testing.T, restrictTo string) *interopServer {
 		logs := &logBuffer{}
 		cmd := exec.Command(bin, "server", "wss://"+addr,
 			"--restrict-to", restrictTo,
+			"--restrict-http-upgrade-path-prefix", "v1",
 			"--websocket-mask-frame",
 		)
 		cmd.Stdout = logs
@@ -336,12 +347,16 @@ func firstMismatch(got, want []byte) int {
 // byte comes back unchanged. One WebSocket frame must be one datagram: a
 // frame boundary bug shows up as a wrong length or mismatched payload.
 //
-// The server is started with --websocket-mask-frame (see startInteropServer),
-// and that flag is load-bearing, not noise: gorilla masks every client frame
-// as RFC 6455 requires, wstunnel 11 unmasks incoming frames only when that
-// flag is set, and without it the handshake still succeeds while every
-// datagram is forwarded XORed with the 4-byte WebSocket mask key — a silent
-// data-plane failure, not a visible handshake error. Do not drop the flag.
+// The server is started with --websocket-mask-frame and
+// --restrict-http-upgrade-path-prefix v1 (see startInteropServer); both flags
+// are load-bearing, not noise. gorilla masks every client frame as RFC 6455
+// requires, wstunnel 11 unmasks incoming frames only when the first flag is
+// set, and without it the handshake still succeeds while every datagram is
+// forwarded XORed with the 4-byte WebSocket mask key — a silent data-plane
+// failure, not a visible handshake error. The second flag is what makes the
+// upgrade path (/v1/events) part of the test: without it the server accepts
+// any path prefix, so a client-side path regression would go unnoticed.
+// Do not drop either flag.
 func TestInterop_UDPRoundTripThroughRealServer(t *testing.T) {
 	echo := startUDPEcho(t)
 	srv := startInteropServer(t, echo.addr)

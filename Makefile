@@ -1,52 +1,52 @@
 # wg-user build orchestration
-# Use: make build / make build-go / make build-rust / make clean / make package / make verify
+# Use: make build / make test / make clean / make package / make verify
 
 SHELL := /bin/bash
 ROOT_DIR := $(shell pwd)
 SCRIPTS  := $(ROOT_DIR)/scripts
 BIN      := $(ROOT_DIR)/bin
 DIST     := $(ROOT_DIR)/dist
-VERSION  := $(shell grep '^version=' $(ROOT_DIR)/module.prop | cut -d= -f2)
+VERSION  := $(shell sed -n 's/^version=//p' $(ROOT_DIR)/module.prop)
 
 ARCHS := arm64-v8a armeabi-v7a x86_64 x86
-WPBINS := $(addprefix $(BIN)/,$(addsuffix /wireproxy,$(ARCHS)))
-TNBINS := $(addprefix $(BIN)/,$(addsuffix /wstunnel,$(ARCHS)))
+GOWBINS := $(addprefix $(BIN)/,$(addsuffix /wg-user,$(ARCHS)))
 WEBUI_DIR := $(ROOT_DIR)/webui
 WEBROOT := $(ROOT_DIR)/webroot
 
 # Files that make up the distributable module zip.
-# NOTE: etc/wireproxy.conf and etc/tunnel.conf are deliberately absent —
-# they hold real keys. customize.sh seeds them from the examples (or keeps
+# NOTE: etc/wireproxy.conf and etc/tunnel.conf* are deliberately absent —
+# they hold real keys. customize.sh seeds them from the example (or keeps
 # the copy already on the device).
-PKG_FILES := module.prop customize.sh uninstall.sh sepolicy.rule service.sh wg-user common/ etc/wireproxy.conf.example etc/tunnel.conf.example webroot/ bin/arm64-v8a bin/armeabi-v7a bin/x86_64 bin/x86 scripts/cargo-wrappers/ README.md LICENSE docs/INSTALL.md docs/CONFIG.md docs/TUNNEL-SERVER.md docs/CHANGELOG.md docs/ARCHITECTURE.md
+PKG_FILES := module.prop customize.sh uninstall.sh sepolicy.rule service.sh wg-user common/ etc/wireproxy.conf.example webroot/ bin/arm64-v8a bin/armeabi-v7a bin/x86_64 bin/x86 README.md LICENSE docs/INSTALL.md docs/CONFIG.md docs/TUNNEL-SERVER.md docs/CHANGELOG.md docs/ARCHITECTURE.md
 
-.PHONY: build build-go build-rust webui webui-clean clean package package-only verify interop help
+.PHONY: build build-go test webui webui-clean clean package package-only verify interop help FORCE
 
 help:
-	@echo "make build      - cross-compile wireproxy (Go) + wstunnel (Rust)"
-	@echo "make build-go   - only wireproxy (faster, ~3 min)"
-	@echo "make build-rust - only wstunnel (~5 min; needs NDK + rustup targets)"
+	@echo "make build      - cross-compile the single wg-user binary for 4 arches"
+	@echo "make build-go   - same as build (kept for CI compatibility)"
+	@echo "make test       - go vet + go test"
 	@echo "make webui      - rebuild the Preact+Tailwind KSU WebUI (needs node)"
 	@echo "make clean      - remove build artifacts"
 	@echo "make package    - zip the module for distribution (after build)"
-	@echo "make verify     - run syntax/static checks and configtest"
+	@echo "make verify     - shell syntax checks (+ CLI/install tests when present)"
 	@echo "make interop    - run the tests against the real wstunnel v11 server (needs $(BIN)/interop/wstunnel)"
 
-build: build-go build-rust
+build: build-go
 
-build-go: $(WPBINS)
+build-go: $(GOWBINS)
+	@sh $(ROOT_DIR)/test/shell/build_test.sh
 
-build-rust: $(TNBINS)
+# One cross-compile per arch. build.sh loops over all four when ARCH is unset;
+# the pattern rule builds just the arch it was asked for.
+#
+# FORCE: Go does its own dependency tracking inside the build cache, and make
+# cannot see the package graph, so every build re-runs the cross-compile
+# instead of calling a stale bin/<arch>/wg-user up to date.
+$(BIN)/%/wg-user: FORCE $(SCRIPTS)/build.sh
+	ARCH=$* bash $(SCRIPTS)/build.sh
 
-$(BIN)/%/wireproxy:
-	GOPROXY=$${GOPROXY:-https://goproxy.cn,direct} \
-	WIREPROXY_VERSION=$${WIREPROXY_VERSION:-v1.1.3} \
-	    bash $(SCRIPTS)/build.sh
-
-$(BIN)/%/wstunnel:
-	ANDROID_NDK_HOME=$${ANDROID_NDK_HOME:-$$HOME/Android/Sdk/ndk/26.3.11579264} \
-	WSTUNNEL_VERSION=$${WSTUNNEL_VERSION:-v11.0.0} \
-	    bash $(SCRIPTS)/cargo-cross.sh
+test:
+	go vet ./... && go test ./...
 
 webui:
 	@echo "==> building Preact + TypeScript + Tailwind WebUI -> $(WEBROOT)..."
@@ -57,8 +57,7 @@ webui-clean:
 	rm -f $(WEBROOT)/app.js $(WEBROOT)/index.html $(WEBROOT)/style.css
 
 clean:
-	rm -rf $(BIN)/*/wireproxy $(BIN)/*/wstunnel
-	rm -rf $(DIST)
+	rm -rf $(BIN)/*/wg-user $(BIN)/interop $(DIST)
 	$(MAKE) webui-clean
 
 package: build webui
@@ -68,7 +67,7 @@ package: build webui
 	  (echo "zip not found, trying tar:" && tar czf $(DIST)/wg-user-$(VERSION).tar.gz $(PKG_FILES))
 	@ls -lh $(DIST)
 
-# Same archive, but without re-running the slow cross-compiles. Use after
+# Same archive, but without re-running the cross-compiles. Use after
 # touching only webui/ or docs/.
 package-only: webui
 	@echo "==> packaging wg-user v$(VERSION) (no rebuild)..."
@@ -77,10 +76,13 @@ package-only: webui
 	  (echo "zip not found, trying tar:" && tar czf $(DIST)/wg-user-$(VERSION).tar.gz $(PKG_FILES))
 	@ls -lh $(DIST)
 
+# No Go toolchain and no built binaries required: syntax-check every script
+# with the interpreter named in its shebang, then run the shell suites that
+# Tasks 11 and 12 add (skipped while they do not exist yet).
 verify:
 	@echo "==> syntax checks (interpreter from the shebang)..."
 	@ok=0; fail=0; \
-	for f in customize.sh uninstall.sh service.sh wg-user scripts/*.sh common/*.sh; do \
+	for f in customize.sh uninstall.sh service.sh wg-user scripts/*.sh common/*.sh test/shell/*.sh; do \
 	    [ -f "$$f" ] || continue; \
 	    interp=sh; \
 	    if head -n 1 "$$f" | grep -q bash; then interp=bash; fi; \
@@ -91,18 +93,10 @@ verify:
 	    fi; \
 	done; \
 	if [ $$fail -gt 0 ]; then echo "$$fail file(s) failed syntax"; exit 1; fi
-	@echo "==> wrapper executability check..."
-	@for f in scripts/cargo-wrappers/*; do \
-	    if [ ! -x "$$f" ]; then echo "  NOT exec: $$f"; exit 1; fi; \
-	done; \
-	echo "  ok: $$(ls scripts/cargo-wrappers/ | wc -l) wrappers"
-	@if [ -x $(BIN)/x86_64/wireproxy ]; then \
-	    echo "==> wireproxy -n configtest..."; \
-	    if [ -f etc/wireproxy.conf ]; then \
-	        $(BIN)/x86_64/wireproxy -n -c etc/wireproxy.conf \
-	            || echo "  (configtest failed; expected with PLACEHOLDER keys)"; \
-	    fi; \
-	fi
+	@echo "==> shell tests..."
+	@for t in test/shell/cli_test.sh test/shell/install_test.sh; do \
+	    if [ -f "$$t" ]; then echo "  running $$t"; sh "$$t" || exit 1; fi; \
+	done
 
 # Interoperability tests against the official wstunnel v11 server. The binary is
 # scratch (bin/interop/ is git-ignored); fetch it with the commands printed when

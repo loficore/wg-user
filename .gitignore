@@ -1,6 +1,5 @@
 # Build artifacts
-bin/*/wireproxy
-bin/*/wstunnel
+bin/*/wg-user
 # Scratch: official wstunnel server binary for the interop tests (make interop)
 bin/interop/
 dist/
@@ -8,7 +7,7 @@ dist/
 
 # User config (replace with real keys locally; never commit)
 etc/wireproxy.conf
-etc/tunnel.conf
+etc/tunnel.conf*
 
 # Editor
 *.swp

@@ -10,8 +10,11 @@ require (
 require (
 	github.com/MakeNowJust/heredoc/v2 v2.0.1 // indirect
 	github.com/google/btree v1.1.2 // indirect
-	// Pinned for the transport that lands in a later task; wireproxy already
-	// requires exactly this version, so the pin is inherited either way.
+	// Pinned ahead of the transport task that will import it. wireproxy does
+	// NOT depend on gorilla/websocket, so this root-only require has no
+	// importer yet: keep it at v1.5.3 and do not run "go mod tidy" until the
+	// transport imports it (tidy would delete this line, and a later
+	// "go get github.com/gorilla/websocket" would resolve @latest instead).
 	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/things-go/go-socks5 v0.0.5 // indirect
 	golang.org/x/crypto v0.52.0 // indirect

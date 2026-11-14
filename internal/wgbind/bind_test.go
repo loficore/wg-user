@@ -17,9 +17,10 @@ type fakeRecv struct {
 	err error
 }
 
-// fakeTransport is a scripted Transport: Send records every frame it is
-// handed, Recv returns queued results and then blocks until the transport is
-// closed (after which it reports net.ErrClosed).
+// fakeTransport is a scripted Transport. It records every frame it is handed,
+// returns queued results from Recv, and then parks until either the caller's
+// stop channel closes or the transport itself is closed (the latter only ever
+// happens because the test decides to, never because the bind did).
 type fakeTransport struct {
 	mu        sync.Mutex
 	sends     [][]byte
@@ -29,14 +30,19 @@ type fakeTransport struct {
 
 	closed    chan struct{}
 	closeOnce sync.Once
-	parked    chan struct{}
-	parkOnce  sync.Once
+
+	// parked is closed the first time Recv has to wait; observed receives a
+	// token for every scripted result handed out.
+	parked   chan struct{}
+	parkOnce sync.Once
+	observed chan struct{}
 }
 
 func newFakeTransport(payloads ...string) *fakeTransport {
 	f := &fakeTransport{
-		closed: make(chan struct{}),
-		parked: make(chan struct{}),
+		closed:   make(chan struct{}),
+		parked:   make(chan struct{}),
+		observed: make(chan struct{}, 8),
 	}
 	for _, p := range payloads {
 		f.results = append(f.results, fakeRecv{pkt: []byte(p)})
@@ -54,13 +60,17 @@ func (f *fakeTransport) Send(pkt []byte) error {
 	return nil
 }
 
-func (f *fakeTransport) Recv(buf []byte) (int, error) {
+func (f *fakeTransport) Recv(buf []byte, stop <-chan struct{}) (int, error) {
 	f.mu.Lock()
 	f.recvCalls++
 	if len(f.results) > 0 {
 		r := f.results[0]
 		f.results = f.results[1:]
 		f.mu.Unlock()
+		select {
+		case f.observed <- struct{}{}:
+		default:
+		}
 		if r.err != nil {
 			return 0, r.err
 		}
@@ -70,13 +80,29 @@ func (f *fakeTransport) Recv(buf []byte) (int, error) {
 
 	// Nothing scripted: park like a live transport waiting for a frame.
 	f.parkOnce.Do(func() { close(f.parked) })
-	<-f.closed
-	return 0, net.ErrClosed
+	select {
+	case <-stop:
+		return 0, fmt.Errorf("fake: receive: %w", net.ErrClosed)
+	case <-f.closed:
+		return 0, fmt.Errorf("fake: receive: %w", net.ErrClosed)
+	}
 }
 
+// Close closes the fake transport itself. The bind must never call it: the
+// transport is owned by the process that created it, not by a bind
+// generation.
 func (f *fakeTransport) Close() error {
 	f.closeOnce.Do(func() { close(f.closed) })
 	return nil
+}
+
+func (f *fakeTransport) isClosed() bool {
+	select {
+	case <-f.closed:
+		return true
+	default:
+		return false
+	}
 }
 
 func (f *fakeTransport) sent() [][]byte {
@@ -239,7 +265,7 @@ func TestBind_ReceiveCopiesIntoBuffer(t *testing.T) {
 	}
 }
 
-func TestBind_ReceiveRetriesTransientErrors(t *testing.T) {
+func TestBind_TransientErrorsAreRetried(t *testing.T) {
 	old := retryInterval
 	retryInterval = time.Millisecond
 	t.Cleanup(func() { retryInterval = old })
@@ -298,6 +324,10 @@ func TestBind_CloseUnblocksReceive(t *testing.T) {
 		t.Fatal("Close did not unblock the parked ReceiveFunc")
 	}
 
+	if tr.isClosed() {
+		t.Fatal("Close closed the transport; the transport outlives bind generations")
+	}
+
 	// Close is idempotent.
 	if err := b.Close(); err != nil {
 		t.Fatalf("second Close: %v", err)
@@ -326,6 +356,105 @@ func TestBind_ReceiveAfterCloseReturnsImmediately(t *testing.T) {
 	}
 }
 
+// TestBind_CloseThenOpenWorksAgain models wireguard-go's BindUpdate, which
+// closes the bind, waits for the receive routines to stop, and only then
+// opens it again. device.Up() starts with BindUpdate, so the very first Up
+// closes before it opens.
+func TestBind_CloseThenOpenWorksAgain(t *testing.T) {
+	tr := newFakeTransport("first", "second")
+	b := New(tr)
+
+	// device.Up() closes before the first Open: there is no generation yet.
+	if err := b.Close(); err != nil {
+		t.Fatalf("Close before first Open: %v", err)
+	}
+
+	recv1 := openBind(t, b)
+	res := recvOnce(recv1, 64)
+	if res.err != nil || string(res.bufs[0][:res.sizes[0]]) != "first" {
+		t.Fatalf("first generation received (%q, %v), want %q", res.bufs[0][:res.sizes[0]], res.err, "first")
+	}
+
+	// BindUpdate for a reconfiguration: Close, wait, Open.
+	if err := b.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if res := recvOnce(recv1, 64); !errors.Is(res.err, net.ErrClosed) {
+		t.Fatalf("retired generation's ReceiveFunc = %v, want net.ErrClosed", res.err)
+	}
+
+	recv2 := openBind(t, b)
+	res = recvOnce(recv2, 64)
+	if res.err != nil {
+		t.Fatalf("ReceiveFunc from the re-opened bind = %v, want the next datagram", res.err)
+	}
+	if res.n != 1 || res.sizes[0] != 6 {
+		t.Fatalf("ReceiveFunc = (%d, sizes=%v), want (1, [6])", res.n, res.sizes)
+	}
+	if got := string(res.bufs[0][:res.sizes[0]]); got != "second" {
+		t.Fatalf("re-opened bind received %q, want %q", got, "second")
+	}
+}
+
+func TestBind_CloseDoesNotCloseTransport(t *testing.T) {
+	tr := newFakeTransport()
+	b := New(tr)
+	recv := openBind(t, b)
+
+	if err := b.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	_ = recv
+
+	if tr.isClosed() {
+		t.Fatal("Close closed the transport; its lifetime belongs to the CLI")
+	}
+	if err := b.Send([][]byte{[]byte("after")}, nil); err != nil {
+		t.Fatalf("Send after Close: %v", err)
+	}
+	got := tr.sent()
+	if len(got) != 1 || string(got[0]) != "after" {
+		t.Fatalf("transport sent %q, want one %q frame", got, "after")
+	}
+}
+
+func TestBind_CloseDuringRetryWaitIsPrompt(t *testing.T) {
+	old := retryInterval
+	retryInterval = time.Second
+	t.Cleanup(func() { retryInterval = old })
+
+	tr := newFakeTransport()
+	tr.results = []fakeRecv{{err: errors.New("transient")}}
+	b := New(tr)
+	recv := openBind(t, b)
+
+	done := make(chan recvResult, 1)
+	go func() { done <- recvOnce(recv, 64) }()
+
+	select {
+	case <-tr.observed:
+		// Recv returned the transient error; the loop is about to wait.
+	case <-time.After(2 * time.Second):
+		t.Fatal("Transport.Recv was never asked for a datagram")
+	}
+
+	start := time.Now()
+	if err := b.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	select {
+	case res := <-done:
+		if !errors.Is(res.err, net.ErrClosed) {
+			t.Fatalf("ReceiveFunc = %v, want net.ErrClosed", res.err)
+		}
+		if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
+			t.Fatalf("Close took %v to interrupt a %v retry wait", elapsed, retryInterval)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close did not interrupt the retry wait")
+	}
+}
+
 func TestBind_ParseEndpointKeepsString(t *testing.T) {
 	b := New(newFakeTransport())
 
@@ -337,20 +466,3 @@ func TestBind_ParseEndpointKeepsString(t *testing.T) {
 		t.Fatalf("DstToString() = %q, want the parsed string", got)
 	}
 }
-
-func TestBind_CloseReportsTransportError(t *testing.T) {
-	sentinel := errors.New("boom")
-	b := New(closingErrTransport{err: sentinel})
-
-	if err := b.Close(); !errors.Is(err, sentinel) {
-		t.Fatalf("Close = %v, want an error wrapping %v", err, sentinel)
-	}
-}
-
-type closingErrTransport struct {
-	err error
-}
-
-func (c closingErrTransport) Send([]byte) error        { return nil }
-func (c closingErrTransport) Recv([]byte) (int, error) { return 0, net.ErrClosed }
-func (c closingErrTransport) Close() error             { return c.err }

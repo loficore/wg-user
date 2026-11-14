@@ -9,7 +9,6 @@ package wgbind
 import (
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/netip"
 	"sync"
@@ -30,59 +29,80 @@ var _ conn.Bind = (*Bind)(nil)
 // successful Recv is exactly one datagram: the transport must not coalesce or
 // split frames.
 //
-// Recv blocks until a datagram arrives, the transport fails, or the transport
-// is closed. A transport that can be torn down should implement io.Closer as
-// well: Bind.Close uses it to unblock a parked Recv.
+// Recv blocks until a datagram arrives, stop is closed, or the transport is
+// closed, and reports net.ErrClosed in the last two cases. stop lets
+// Bind.Close interrupt a parked receive without tearing the transport down:
+// wireguard-go closes and reopens a bind on every device.Up (BindUpdate), so
+// the transport must outlive bind generations.
 type Transport interface {
 	Send(pkt []byte) error
-	Recv(buf []byte) (int, error)
+	Recv(buf []byte, stop <-chan struct{}) (int, error)
 }
 
 // Bind implements conn.Bind over a Transport.
+//
+// Receives are grouped into generations: each Open creates one, and Close
+// ends only the current one. wireguard-go's device.BindUpdate runs
+// bind.Close() → stopping.Wait() → bind.Open(), and device.Up starts with
+// BindUpdate, so the first Up closes a bind that was never opened. Close is
+// therefore a no-op until there is a generation, and it never touches the
+// transport (*wstunnel.Client is terminal on Close and must survive).
 type Bind struct {
 	transport Transport
-	done      chan struct{}
 
 	// remote is the endpoint ParseEndpoint last returned, handed back as the
 	// source of received datagrams. wireguard-go stores it as the peer's
 	// endpoint, and a nil there would make Send fail with "no known endpoint".
 	remote atomic.Pointer[endpoint]
 
-	closeOnce sync.Once
-	closeErr  error
+	mu  sync.Mutex
+	gen *generation // current generation, nil before the first Open or after Close
+}
+
+// generation is one Open/Close cycle: its done channel is closed by Close to
+// stop the ReceiveFuncs that belong to it.
+type generation struct {
+	done chan struct{}
 }
 
 // New returns a Bind that exchanges datagrams over t.
 func New(t Transport) *Bind {
 	b := &Bind{
 		transport: t,
-		done:      make(chan struct{}),
 	}
 	b.remote.Store(&endpoint{})
 	return b
 }
 
-// Open reports the single receive function this bind offers. Nothing is
+// Open reports the single receive function of a new generation. Nothing is
 // bound: the transport already owns the connection, so port is ignored and
 // the reported port is zero.
 func (b *Bind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
-	return []conn.ReceiveFunc{b.receive}, 0, nil
+	g := &generation{done: make(chan struct{})}
+	b.mu.Lock()
+	b.gen = g
+	b.mu.Unlock()
+
+	return []conn.ReceiveFunc{func(packets [][]byte, sizes []int, eps []conn.Endpoint) (int, error) {
+		return b.receive(g, packets, sizes, eps)
+	}}, 0, nil
 }
 
-// Close shuts the bind down and is idempotent. It unblocks a ReceiveFunc
-// parked in Transport.Recv by closing a transport that implements io.Closer;
-// afterwards ReceiveFunc reports net.ErrClosed. The first transport close
-// error is reported on every subsequent call.
+// Close ends the current generation and is idempotent. Closing the
+// generation's stop channel wakes a ReceiveFunc blocked in Transport.Recv
+// with net.ErrClosed, which wireguard-go's stopping.Wait() is waiting for;
+// the next Open starts a fresh generation. The transport is deliberately left
+// alive, and Close before the first Open is a no-op.
 func (b *Bind) Close() error {
-	b.closeOnce.Do(func() {
-		close(b.done)
-		if closer, ok := b.transport.(io.Closer); ok {
-			if err := closer.Close(); err != nil {
-				b.closeErr = fmt.Errorf("wgbind: close transport: %w", err)
-			}
-		}
-	})
-	return b.closeErr
+	b.mu.Lock()
+	g := b.gen
+	b.gen = nil
+	b.mu.Unlock()
+
+	if g != nil {
+		close(g.done)
+	}
+	return nil
 }
 
 // SetMark is a no-op: datagrams leave through the transport, not a socket
@@ -94,7 +114,8 @@ func (b *Bind) SetMark(mark uint32) error {
 // Send gives each buffer to the transport as its own frame. Buffers are never
 // coalesced: the server forwards frames as individual UDP datagrams, so
 // batching two WireGuard packets into one frame would corrupt the stream.
-// ep is ignored; the transport already knows where the peer is.
+// ep is ignored; the transport already knows where the peer is. Send keeps
+// working after Close, since the transport is not closed with the bind.
 func (b *Bind) Send(bufs [][]byte, ep conn.Endpoint) error {
 	for _, buf := range bufs {
 		if err := b.transport.Send(buf); err != nil {
@@ -118,8 +139,8 @@ func (b *Bind) BatchSize() int {
 	return 1
 }
 
-// receive blocks until the transport delivers a datagram, the bind is closed,
-// or the transport dies for good.
+// receive blocks until the transport delivers a datagram, the generation is
+// closed, or the transport dies for good.
 //
 // Transient transport errors must never leave this loop. wireguard-go's
 // receive routine (device/receive.go:72-127 in v0.0.0-20250521234502) counts
@@ -129,19 +150,19 @@ func (b *Bind) BatchSize() int {
 // the WebSocket is reconnecting, so propagating those errors would kill
 // receiving during a routine reconnect. Only net.ErrClosed (teardown) is
 // returned.
-func (b *Bind) receive(packets [][]byte, sizes []int, eps []conn.Endpoint) (int, error) {
+func (b *Bind) receive(g *generation, packets [][]byte, sizes []int, eps []conn.Endpoint) (int, error) {
 	if len(packets) == 0 || len(sizes) == 0 {
 		return 0, fmt.Errorf("wgbind: receive: %d packet buffers", len(packets))
 	}
 
 	for {
 		select {
-		case <-b.done:
+		case <-g.done:
 			return 0, net.ErrClosed
 		default:
 		}
 
-		n, err := b.transport.Recv(packets[0])
+		n, err := b.transport.Recv(packets[0], g.done)
 		if err == nil {
 			sizes[0] = n
 			if len(eps) > 0 {
@@ -155,9 +176,10 @@ func (b *Bind) receive(packets [][]byte, sizes []int, eps []conn.Endpoint) (int,
 
 		// Transient (reconnecting, write timeout, oversized frame): pause
 		// briefly so a broken transport cannot spin this goroutine, then
-		// retry. Do not return the error; see the comment above.
+		// retry. Do not return the error; see the comment above. Selecting on
+		// done means Close never waits out the full interval.
 		select {
-		case <-b.done:
+		case <-g.done:
 			return 0, net.ErrClosed
 		case <-time.After(retryInterval):
 		}

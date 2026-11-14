@@ -262,7 +262,7 @@ func TestSendRecv_PreservesDatagramBoundaries(t *testing.T) {
 		}
 
 		buf := make([]byte, 2000)
-		n, err := c.Recv(buf)
+		n, err := c.Recv(buf, nil)
 		if err != nil {
 			t.Fatalf("Recv(%d bytes): %v", size, err)
 		}
@@ -281,6 +281,48 @@ func TestSendRecv_PreservesDatagramBoundaries(t *testing.T) {
 		if got := len(fs.received()[i]); got != size {
 			t.Errorf("server frame %d has %d bytes, want %d", i, got, size)
 		}
+	}
+}
+
+// TestRecv_StopChannelInterruptsWithoutClosingClient pins the interrupt used
+// by wgbind: a closed stop channel must behave exactly like a closed client
+// for this call, without closing the client or poisoning the connection.
+func TestRecv_StopChannelInterruptsWithoutClosingClient(t *testing.T) {
+	fs := newFakeServer(t, nil)
+	c := dialTestClient(t, fs, Config{})
+
+	stop := make(chan struct{})
+	close(stop)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.Recv(make([]byte, 16), stop)
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("Recv with a closed stop = %v, want net.ErrClosed", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Recv ignored the closed stop channel")
+	}
+
+	if got := c.State(); got != stateConnected {
+		t.Fatalf("State after an interrupted Recv = %q, want %q (the client must stay usable)", got, stateConnected)
+	}
+
+	if err := c.Send([]byte("live")); err != nil {
+		t.Fatalf("Send after an interrupted Recv: %v", err)
+	}
+	buf := make([]byte, 16)
+	n, err := c.Recv(buf, nil)
+	if err != nil {
+		t.Fatalf("Recv after an interrupted Recv: %v", err)
+	}
+	if n != len("live") || string(buf[:n]) != "live" {
+		t.Fatalf("Recv = %q, want %q", buf[:n], "live")
 	}
 }
 
@@ -328,7 +370,7 @@ func TestRecv_AfterCloseReturnsErrClosed(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	_, err := c.Recv(make([]byte, 2000))
+	_, err := c.Recv(make([]byte, 2000), nil)
 	if !errors.Is(err, net.ErrClosed) {
 		t.Fatalf("Recv after Close = %v, want net.ErrClosed", err)
 	}
@@ -373,7 +415,7 @@ func TestRecv_RejectsOversizeFrame(t *testing.T) {
 	})
 	c := dialTestClient(t, fs, Config{})
 
-	_, err := c.Recv(make([]byte, 2000))
+	_, err := c.Recv(make([]byte, 2000), nil)
 	if err == nil {
 		t.Fatal("Recv accepted a 70000-byte frame past the 65536-byte read limit")
 	}
@@ -396,7 +438,7 @@ func TestRecv_RejectsFrameLargerThanBuffer(t *testing.T) {
 		t.Fatalf("Send: %v", err)
 	}
 
-	_, err := c.Recv(make([]byte, 100))
+	_, err := c.Recv(make([]byte, 100), nil)
 	if err == nil {
 		t.Fatal("Recv truncated a frame larger than the caller's buffer")
 	}
@@ -517,7 +559,7 @@ func TestReadLoop_StaleFailureIgnoredAfterRedial(t *testing.T) {
 		t.Fatalf("Send on the new connection: %v", err)
 	}
 	buf := make([]byte, 16)
-	n, err := c.Recv(buf)
+	n, err := c.Recv(buf, nil)
 	if err != nil {
 		t.Fatalf("Recv on the new connection was poisoned by the stale reader: %v", err)
 	}
@@ -557,7 +599,7 @@ func TestRecv_SurvivesRedialWithoutNilError(t *testing.T) {
 	}
 	res := make(chan result, 1)
 	go func() {
-		n, err := c.Recv(make([]byte, 16))
+		n, err := c.Recv(make([]byte, 16), nil)
 		res <- result{n: n, err: err}
 	}()
 

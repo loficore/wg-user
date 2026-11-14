@@ -369,13 +369,18 @@ func (c *Client) ping() {
 // Recv copies the next received datagram into buf and returns its length. If
 // the frame is larger than buf the frame is discarded and an error returned
 // rather than truncating a datagram. After Close, Recv returns an error
-// wrapping net.ErrClosed.
-func (c *Client) Recv(buf []byte) (int, error) {
+// wrapping net.ErrClosed. Closing stop interrupts the call the same way: it
+// returns net.ErrClosed without closing the client, so a caller can abandon a
+// wait (wgbind uses this to make conn.Bind.Close prompt) and keep the
+// connection usable.
+func (c *Client) Recv(buf []byte, stop <-chan struct{}) (int, error) {
 	for {
 		// Prefer the closed signal over whatever happens to be buffered: once
 		// Close returns, callers must observe net.ErrClosed deterministically.
 		select {
 		case <-c.done:
+			return 0, fmt.Errorf("wstunnel: receive: %w", net.ErrClosed)
+		case <-stop:
 			return 0, fmt.Errorf("wstunnel: receive: %w", net.ErrClosed)
 		default:
 		}
@@ -389,6 +394,8 @@ func (c *Client) Recv(buf []byte) (int, error) {
 
 		select {
 		case <-c.done:
+			return 0, fmt.Errorf("wstunnel: receive: %w", net.ErrClosed)
+		case <-stop:
 			return 0, fmt.Errorf("wstunnel: receive: %w", net.ErrClosed)
 		case <-errCh:
 			// A redial may have retired this generation between the close and

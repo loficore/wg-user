@@ -286,7 +286,7 @@ func TestRun_StopsOnContextCancel(t *testing.T) {
 	if err := c.Send([]byte("late")); err != nil {
 		t.Errorf("Send after Run returned %v, want nil", err)
 	}
-	if _, err := c.Recv(make([]byte, 8)); !errors.Is(err, net.ErrClosed) {
+	if _, err := c.Recv(make([]byte, 8), nil); !errors.Is(err, net.ErrClosed) {
 		t.Errorf("Recv after Run = %v, want net.ErrClosed", err)
 	}
 }
@@ -351,7 +351,7 @@ func TestRun_ReturnsFatalOnCertificateError(t *testing.T) {
 	// reports net.ErrClosed instead of parking on a connection that will never
 	// come back.
 	recvDone := make(chan error, 1)
-	go func() { _, err := c.Recv(make([]byte, 8)); recvDone <- err }()
+	go func() { _, err := c.Recv(make([]byte, 8), nil); recvDone <- err }()
 	select {
 	case err := <-recvDone:
 		if !errors.Is(err, net.ErrClosed) {

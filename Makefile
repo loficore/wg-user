@@ -77,15 +77,16 @@ package-only: webui
 	@ls -lh $(DIST)
 
 verify:
-	@echo "==> sh -n syntax checks..."
+	@echo "==> syntax checks (interpreter from the shebang)..."
 	@ok=0; fail=0; \
 	for f in customize.sh uninstall.sh service.sh wg-user scripts/*.sh common/*.sh; do \
-	    if [ -f "$$f" ]; then \
-	        if sh -n "$$f" 2>/dev/null; then \
-	            echo "  ok: $$f"; ok=$$((ok+1)); \
-	        else \
-	            echo "  FAIL: $$f"; sh -n "$$f"; fail=$$((fail+1)); \
-	        fi; \
+	    [ -f "$$f" ] || continue; \
+	    interp=sh; \
+	    if head -n 1 "$$f" | grep -q bash; then interp=bash; fi; \
+	    if command -v $$interp >/dev/null 2>&1 && $$interp -n "$$f" 2>/dev/null; then \
+	        echo "  ok: $$f ($$interp)"; ok=$$((ok+1)); \
+	    else \
+	        echo "  FAIL: $$f ($$interp)"; $$interp -n "$$f"; fail=$$((fail+1)); \
 	    fi; \
 	done; \
 	if [ $$fail -gt 0 ]; then echo "$$fail file(s) failed syntax"; exit 1; fi

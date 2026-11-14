@@ -12,3 +12,12 @@ updates:
     schedule:
       interval: weekly
     labels: [webui]
+    ignore:
+      # Major bumps here are migrations (preact 11, tailwind 4, typescript 7
+      # all change the build); open them deliberately, not every week.
+      - dependency-name: preact
+        update-types: [version-update:semver-major]
+      - dependency-name: tailwindcss
+        update-types: [version-update:semver-major]
+      - dependency-name: typescript
+        update-types: [version-update:semver-major]

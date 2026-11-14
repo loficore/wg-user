@@ -95,13 +95,20 @@ GitHub Release. The tag must equal `v$(version)` from `module.prop`.
 Cut a release:
 
 ```bash
-# 1. bump module.prop (version + versionCode) and webui/package.json
-# 2. rebuild the committed bundle
-make webui
-# 3. commit, then tag and push
-jj tag set "v$(sed -n 's/^version=//p' module.prop)"
-jj git push --tag v0.2.0 --bookmark main
+V=$(sed -n 's/^version=//p' module.prop)
+
+# after bumping module.prop (version + versionCode) and webui/package.json:
+make webui                      # rebuild the committed bundle
+jj describe -m "release: $V"
+jj bookmark set main -r @
+jj git push --bookmark main     # -> CI run on main
+jj tag set "v$V" -r main
+jj git push --tag "v$V"         # -> Release run
 ```
+
+Push the branch and the tag **separately**: a single `git push` that
+carries both refs only delivers the branch event, so CI runs and the
+release silently does not.
 
 `workflow_dispatch` on the release workflow runs the same build without
 creating a release — useful for verifying the toolchain.

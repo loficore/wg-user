@@ -1,6 +1,8 @@
 # Build artifacts
 bin/*/wireproxy
 bin/*/wstunnel
+# Scratch: official wstunnel server binary for the interop tests (make interop)
+bin/interop/
 dist/
 /src/
 

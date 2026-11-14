@@ -20,7 +20,7 @@ WEBROOT := $(ROOT_DIR)/webroot
 # the copy already on the device).
 PKG_FILES := module.prop customize.sh uninstall.sh sepolicy.rule service.sh wg-user common/ etc/wireproxy.conf.example etc/tunnel.conf.example webroot/ bin/arm64-v8a bin/armeabi-v7a bin/x86_64 bin/x86 scripts/cargo-wrappers/ README.md LICENSE docs/INSTALL.md docs/CONFIG.md docs/TUNNEL-SERVER.md docs/CHANGELOG.md docs/ARCHITECTURE.md
 
-.PHONY: build build-go build-rust webui webui-clean clean package package-only verify help
+.PHONY: build build-go build-rust webui webui-clean clean package package-only verify interop help
 
 help:
 	@echo "make build      - cross-compile wireproxy (Go) + wstunnel (Rust)"
@@ -30,6 +30,7 @@ help:
 	@echo "make clean      - remove build artifacts"
 	@echo "make package    - zip the module for distribution (after build)"
 	@echo "make verify     - run syntax/static checks and configtest"
+	@echo "make interop    - run the tests against the real wstunnel v11 server (needs $(BIN)/interop/wstunnel)"
 
 build: build-go build-rust
 
@@ -102,3 +103,17 @@ verify:
 	            || echo "  (configtest failed; expected with PLACEHOLDER keys)"; \
 	    fi; \
 	fi
+
+# Interoperability tests against the official wstunnel v11 server. The binary is
+# scratch (bin/interop/ is git-ignored); fetch it with the commands printed when
+# it is missing. Pass WSTUNNEL_SERVER_BIN to use a different build.
+interop:
+	@if [ ! -x "$${WSTUNNEL_SERVER_BIN:-$(BIN)/interop/wstunnel}" ]; then \
+	    echo "missing wstunnel v11.0.0 server binary ($${WSTUNNEL_SERVER_BIN:-$(BIN)/interop/wstunnel}); fetch it with:"; \
+	    echo "  mkdir -p $(BIN)/interop && curl -fsSL -o /tmp/wstunnel.tar.gz \\"; \
+	    echo "    https://github.com/erebe/wstunnel/releases/download/v11.0.0/wstunnel_11.0.0_linux_amd64.tar.gz"; \
+	    echo "  tar -xzf /tmp/wstunnel.tar.gz -C $(BIN)/interop wstunnel && chmod +x $(BIN)/interop/wstunnel"; \
+	    exit 1; \
+	fi
+	@WSTUNNEL_SERVER_BIN=$${WSTUNNEL_SERVER_BIN:-$(BIN)/interop/wstunnel} \
+	    go test -tags interop ./internal/wstunnel -run Interop -v

@@ -107,6 +107,11 @@ verify:
 # Interoperability tests against the official wstunnel v11 server. The binary is
 # scratch (bin/interop/ is git-ignored); fetch it with the commands printed when
 # it is missing. Pass WSTUNNEL_SERVER_BIN to use a different build.
+#
+# Fetch commands are inline (not a download target) because this is a manual,
+# local-only step. Note the asset name: v11.0.0 names its Linux x86_64 build
+# wstunnel_11.0.0_linux_amd64.tar.gz (the older wstunnel-v11.0.0-x86_64-... form
+# 404s), and the tarball stores the binary without the exec bit, hence chmod.
 interop:
 	@if [ ! -x "$${WSTUNNEL_SERVER_BIN:-$(BIN)/interop/wstunnel}" ]; then \
 	    echo "missing wstunnel v11.0.0 server binary ($${WSTUNNEL_SERVER_BIN:-$(BIN)/interop/wstunnel}); fetch it with:"; \

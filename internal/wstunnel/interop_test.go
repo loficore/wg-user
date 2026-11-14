@@ -335,6 +335,13 @@ func firstMismatch(got, want []byte) int {
 // through the real server to a real UDP echo server and checks that every
 // byte comes back unchanged. One WebSocket frame must be one datagram: a
 // frame boundary bug shows up as a wrong length or mismatched payload.
+//
+// The server is started with --websocket-mask-frame (see startInteropServer),
+// and that flag is load-bearing, not noise: gorilla masks every client frame
+// as RFC 6455 requires, wstunnel 11 unmasks incoming frames only when that
+// flag is set, and without it the handshake still succeeds while every
+// datagram is forwarded XORed with the 4-byte WebSocket mask key — a silent
+// data-plane failure, not a visible handshake error. Do not drop the flag.
 func TestInterop_UDPRoundTripThroughRealServer(t *testing.T) {
 	echo := startUDPEcho(t)
 	srv := startInteropServer(t, echo.addr)

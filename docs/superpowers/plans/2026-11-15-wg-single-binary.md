@@ -187,8 +187,8 @@ jj new
       BackoffMin, BackoffMax time.Duration // 测试可缩短；0 时用 500ms / 30s
   }
   func New(cfg Config) *Client
-  func (c *Client) Send(pkt []byte) error      // 未连接时丢弃并返回 nil
-  func (c *Client) Recv(buf []byte) (int, error) // 关闭后返回 net.ErrClosed
+  func (c *Client) Send(pkt []byte) error                          // 未连接时丢弃并返回 nil
+  func (c *Client) Recv(buf []byte, stop <-chan struct{}) (int, error) // stop 关闭或 Client 关闭后返回 net.ErrClosed
   func (c *Client) Close() error
   func (c *Client) State() string             // "connecting" | "connected" | "reconnecting"
   ```
@@ -307,12 +307,15 @@ jj new
 
 **Interfaces:**
 - Consumes: `conn.Bind`（`Open/Close/SetMark/Send/ParseEndpoint/BatchSize`），`conn.ReceiveFunc`，`conn.Endpoint`。
+
+**wireguard-go 的真实生命周期（务必按此实现）：** `device.BindUpdate()` 是 `bind.Close()` → `net.stopping.Wait()` → `bind.Open()`，而 `Up()` 开头就调 `BindUpdate()` —— 所以**首次 `Up()` 之前就会先 `Close()` 一次**。`Close` 因此必须只终止"当前代"、立刻唤醒阻塞的 `ReceiveFunc`（否则 `stopping.Wait()` 永久卡死），并且让随后的 `Open()` 重新可用；**绝不能关闭 transport**（transport 由 CLI 关闭）。
 - Produces:
   ```go
   package wgbind
   type Transport interface {
       Send(pkt []byte) error
-      Recv(buf []byte) (int, error)
+      // stop 关闭时返回 net.ErrClosed，用于让 Close 唤醒阻塞的接收而不关闭 transport。
+      Recv(buf []byte, stop <-chan struct{}) (int, error)
   }
   func New(t Transport) *Bind
   ```
@@ -327,11 +330,14 @@ func TestBind_SendOneFramePerBuffer(t *testing.T) {
 func TestBind_BatchSizeIsOne(t *testing.T) // b.BatchSize() == 1
 
 func TestBind_ReceiveCopiesAtOffset(t *testing.T) {
-	// fake transport 返回 "hello"；ReceiveFunc 的 buf 头部预留 16 字节 offset，
-	// 断言 sizes[0]==5 且 bufs[0][16:21]=="hello"
+	// fake transport 返回 "hello"；断言 sizes[0]==5 且 packets[0][:5]=="hello"
+	// 且 eps[0] 非 nil（pinned wireguard-go 的 ReceiveFunc 没有 offset 参数）
 }
 
 func TestBind_CloseUnblocksReceive(t *testing.T) // Close 后 ReceiveFunc 返回 net.ErrClosed
+func TestBind_CloseThenOpenWorksAgain(t *testing.T) // wireguard-go 的 Close→Open 生命周期：第二轮 Open 的 ReceiveFunc 仍能收包
+func TestBind_TransientErrorsAreRetried(t *testing.T) // Transport.Recv 连续返回错误时 ReceiveFunc 不返回错误，且在重试
+func TestBind_CloseDoesNotCloseTransport(t *testing.T) // 关闭后 transport 仍可 Send（生命周期归 CLI）
 
 func TestBind_ParseEndpointKeepsString(t *testing.T) // ep.DstToString() == "127.0.0.1:51820"
 ```
@@ -343,7 +349,7 @@ Expected: FAIL（`New` 未定义）
 
 - [ ] **Step 3: 实现 `Bind`**
 
-`Open` 忽略端口、返回单个 `ReceiveFunc`（内部循环调 `Transport.Recv(bufs[0][offset:])`，成功则写 `sizes[0]` 返回 1）；`Send` 对每个 buf 各调一次 `Transport.Send`；`SetMark` 返回 nil；`ParseEndpoint` 返回只保存原字符串的 endpoint；`Close` 用 `sync.Once` 关闭 done channel。
+`Open` 忽略端口、建立新一代（自己的 stop 通道）并返回单个 `ReceiveFunc`；`ReceiveFunc` 循环调 `Transport.Recv(packets[0], stop)`，成功则写 `sizes[0]`/`eps[0]` 返回 1，`net.ErrClosed` 直接返回，其它错误按 50ms 重试（绝不上抛，否则 wireguard-go 接收协程会永久退出）；`Send` 对每个 buf 各调一次 `Transport.Send`；`SetMark` 返回 nil；`ParseEndpoint` 返回只保存原字符串的 endpoint；`Close` 只 `close` 当前代的 stop 通道（幂等），不碰 transport；`Close` 之后 `Open` 必须能再次工作。
 
 - [ ] **Step 4: 跑测试确认通过**
 

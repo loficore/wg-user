@@ -130,12 +130,15 @@ Claims：
 
 接口（wireguard-go `conn.Bind`）：`Open`、`Close`、`SetMark`、`Send`、`ParseEndpoint`、`BatchSize`。
 
-- `Send(bufs, ep)`：对每个 buf 调用一次 `transport.Send`（一帧一包，不合并——合并会被服务端当成单个 UDP 数据报）。未连接时丢弃并返回 `nil`，同时以 1 次/秒的速率限制写 debug 日志，避免握手重试把日志刷爆。
-- `Open(port)`：启动接收协程，返回单个 `ReceiveFunc`；忽略 `port`（无本地 socket），返回 `actualPort = 0`。
-- `ReceiveFunc(bufs, sizes, offset)`：阻塞直到收到一帧，把 payload 拷进 `bufs[0][offset:]`，写 `sizes[0]`，返回 `1`；`Close()` 之后返回 `net.ErrClosed`。
+- `Send(bufs, ep)`：对每个 buf 调用一次 `transport.Send`（一帧一包，不合并——合并会被服务端当成单个 UDP 数据报）。未连接时丢弃并返回 `nil`。
+- `Open(port)`：返回单个 `ReceiveFunc`；忽略 `port`（无本地 socket），返回 `actualPort = 0`。每次 `Open` 建立一个新的"代"（generation），拥有自己的停止通道。
+- `ReceiveFunc(packets, sizes, eps)`：阻塞直到收到一帧，把 payload 拷进 `packets[0]`（**注意：pinned wireguard-go 的 `conn.ReceiveFunc` 没有 `offset` 参数**），写 `sizes[0]`、`eps[0]`，返回 `1`。
+- **`Close` 只终止当前代，不关闭 transport**。wireguard-go 的 `BindUpdate()` 会在**首次 `device.Up()`** 时执行 `bind.Close()` → `net.stopping.Wait()` → `bind.Open()`，所以 `Close` 必须 (a) 立刻唤醒阻塞中的 `ReceiveFunc`（让它返回 `net.ErrClosed`，否则 `stopping.Wait()` 永久卡住），(b) 使随后的 `Open` 重新可用。transport 的生命周期归 CLI 所有，由 CLI 在退出时关闭。
+- 为了让 `Close` 能唤醒阻塞的 `Recv` 而不关闭 transport，`Transport` 接口的接收方法是可中断的：`Recv(buf []byte, stop <-chan struct{}) (int, error)`，`stop` 关闭时返回 `net.ErrClosed`。
+- **`ReceiveFunc` 绝不把瞬时错误抛给 wireguard-go**：后者连续 10 次错误后会永久退出接收协程（`device/receive.go`），所以除 `net.ErrClosed` 外的错误一律按 50ms 间隔重试。
 - `ParseEndpoint(s)`：返回携带原字符串的 endpoint（`DstToString` 原样返回），仅用于日志与 IPC 兼容。
 - `BatchSize()`：返回 1。
-- `SetMark`：no-op（root 守护进程，不走 SO_MARK）。
+- `SetMark`：no-op（没有内核 socket，标记无处可设）。
 
 配置校验：`Mode = wstunnel` 时只允许恰好一个 `[Peer]`（单条传输只能对应一个对端）；`Mode = off` 保留上游行为。
 

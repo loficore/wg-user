@@ -311,7 +311,7 @@ migrate_tunnel_conf() {
         ""|off)   mode=off ;;
         wstunnel) mode=wstunnel ;;
         *)
-            log_warn "etc/tunnel.conf: mode='$mode_raw' is neither 'off' nor 'wstunnel'; migrating as 'off'"
+            log_warn "etc/tunnel.conf: mode='$mode_raw' is neither 'off' nor 'wstunnel'; migrating as 'off'. With the transport disabled, [Peer] Endpoint must be the real WireGuard server address: the old Endpoint was the local UDP listener used by 0.2.0 (local-udp), so the migrated file parses but would send UDP to the phone."
             mode=off
             ;;
     esac
@@ -343,7 +343,7 @@ migrate_tunnel_conf() {
     user=$(old_conf_value "$old" username)
     pass=$(old_conf_value "$old" password)
 
-    # insecure: reproduce 0.2.x exactly. It decided with
+    # insecure: reproduce 0.2.x faithfully for a single key. It decided with
     #   grep -Eqi '^[[:space:]]*insecure[[:space:]]*=[[:space:]]*(false|no|0)'
     # and only added --tls-verify-certificate when that matched. The pattern is
     # prefix-anchored, so "falsey"/"none"/"nope"/"0.1" also counted as
@@ -355,6 +355,9 @@ migrate_tunnel_conf() {
     # Insecure = false, every other non-empty value (and an absent/empty key)
     # -> Insecure = true. Ineffective when the transport is off (no TLS), so
     # the key is only written for Mode = wstunnel.
+    # Caveat: old_conf_value keeps the first occurrence of a duplicate key, while
+    # 0.2.x's grep matched any matching line, so the two can disagree when the
+    # old file repeats the key.
     insecure=""
     if [ "$mode" = wstunnel ]; then
         insecure_raw=$(strip_comment "$(old_conf_value "$old" insecure)")

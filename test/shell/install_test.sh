@@ -295,6 +295,9 @@ assert_not_contains 'Mode = on' "$mod/etc/wireproxy.conf"
 assert_line 'Endpoint = 127.0.0.1:51820' "$mod/etc/wireproxy.conf"
 # No TLS is in play, so no Insecure key (and no advice to set one).
 assert_not_contains 'Insecure =' "$mod/etc/wireproxy.conf"
+printf '%s\n' "$out" | grep -F 'Endpoint must be the real WireGuard server address' >/dev/null \
+    || fail "expected the unknown-mode warning to explain the Endpoint requirement:
+$out"
 pass "unknown mode becomes off"
 
 # ---------- E. unsupported URL scheme ----------

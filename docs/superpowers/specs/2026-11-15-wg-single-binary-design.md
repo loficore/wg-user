@@ -264,7 +264,7 @@ updated=1763000000
 
 ### 10.1 构建
 
-- `go.mod` 固定 `go 1.26`（wireproxy v1.1.3 的 go.mod 即 `go 1.26.0`）；新增依赖：`github.com/gorilla/websocket`、`github.com/go-ini/ini`（已随 wireproxy 间接引入，改为直接依赖）。
+- `go.mod` 固定 `go 1.26.0`（与 wireproxy v1.1.3 的 go.mod 声明一致）；新增依赖：`github.com/gorilla/websocket`、`github.com/go-ini/ini`（已随 wireproxy 间接引入，改为直接依赖）。
 - `scripts/build.sh`：对 4 个架构执行 `GOOS=linux GOARCH=<arm64|arm|amd64|386> CGO_ENABLED=0 go build -trimpath -ldflags '-s -w' -o bin/<arch>/wg-user ./cmd/wg-user`。
 - 删除：`scripts/cargo-cross.sh`、`scripts/cargo-wrappers/`（12 个 wrapper）、`bin/*/wstunnel`、`bin/*/wireproxy`。
 - `.gitignore`：`bin/*/wireproxy`、`bin/*/wstunnel` → `bin/*/wg-user`；`etc/tunnel.conf` → `etc/tunnel.conf*`（迁移后的 `.migrated` 可能含 basic-auth 凭据，仍必须忽略）。

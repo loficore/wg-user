@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- Go 版本 `1.26`；模块路径 `github.com/loficore/wg-user`。
+- Go 版本 `1.26.0`；模块路径 `github.com/loficore/wg-user`。
 - 依赖钉死：`github.com/windtf/wireproxy v1.1.3`、`github.com/gorilla/websocket v1.5.3`、`github.com/go-ini/ini v1.67.0`。不新增其它运行时依赖。
 - 交叉编译：`GOOS=linux CGO_ENABLED=0 go build -trimpath -ldflags '-s -w'`，架构映射 `arm64→arm64-v8a`、`arm→armeabi-v7a`、`amd64→x86_64`、`386→x86`。
 - 配置键与默认值（逐字）：`Mode` ∈ {`off`,`wstunnel`}，缺 section 等于 `off`；`Path` 默认 `v1`；`Keepalive` 默认 `25` 秒，`0` 表示关闭；`Insecure` 默认 `false`。
@@ -100,7 +100,7 @@ Expected: FAIL（包不存在 / `Load` 未定义）
 
 - [ ] **Step 3: 实现 `Load`**
 
-先 `go mod init github.com/loficore/wg-user`，再 `go get github.com/windtf/wireproxy@v1.1.3 github.com/gorilla/websocket@v1.5.3 github.com/go-ini/ini@v1.67.0`（`go.mod` 的 `go` 行必须是 `1.26`）。
+先 `go mod init github.com/loficore/wg-user`，再 `go get github.com/windtf/wireproxy@v1.1.3 github.com/gorilla/websocket@v1.5.3 github.com/go-ini/ini@v1.67.0`（`go.mod` 的 `go` 行必须是 `1.26.0`，与 wireproxy v1.1.3 一致）。
 
 然后 `ini.Load(path)` 拿 `[Transport]` section 的原始键值，再 `wireproxy.ParseConfig(path)`。校验顺序固定：`Mode` 合法 → `wstunnel` 时 `URL` 非空且 scheme 为 `ws`/`wss` → `Path` 缺省 `v1` → `Keepalive` 缺省 25、负数报错 → `Endpoint` 存在 → `len(Peers)==1`。所有错误用 `fmt.Errorf("config %s: ...", path)` 包一层。
 
@@ -599,7 +599,7 @@ Expected: FAIL（`missing bin/arm64-v8a/wg-user`）
 
 - [ ] **Step 3: 重写 `scripts/build.sh`、改 `Makefile`/`.gitignore`/`.tool-versions`、删 Rust 资产**
 
-`scripts/build.sh` 保留现有 `TARGETS` 映射与 `GOPROXY` 默认，循环体改为 `go build -trimpath -ldflags "-s -w -X main.version=$(VERSION)" -o "$OUT_DIR/$arch_dir/wg-user" ./cmd/wg-user`（`VERSION` 从 `module.prop` 读，与现有 `Makefile` 的 `VERSION` 变量同源），且必须先 `go mod download`（在 `ROOT_DIR` 下，不再建临时模块）。`Makefile` 目标分工（CI 依赖这个划分）：`build: build-go`；`WPBINS/TNBINS` 换成 `GOWBINS := $(addprefix $(BIN)/,$(addsuffix /wg-user,$(ARCHS)))`；`test:` = `go vet ./... && go test ./...`；`verify:` = 所有脚本 `sh -n` + `sh test/shell/cli_test.sh` + `sh test/shell/install_test.sh`（不依赖 Go 工具链与已构建产物）；`build-go` 末尾加 `sh test/shell/build_test.sh`。`.gitignore` 用 `bin/*/wg-user` 替换两行旧规则，`etc/tunnel.conf` 改成 `etc/tunnel.conf*`。`.tool-versions` 增加一行 `golang 1.26`。`clean:` 改为 `rm -rf $(BIN)/*/wg-user $(BIN)/interop $(DIST)`；`PKG_FILES` 里删除 `etc/tunnel.conf.example`（文件本体由 Task 12 删除）。
+`scripts/build.sh` 保留现有 `TARGETS` 映射与 `GOPROXY` 默认，循环体改为 `go build -trimpath -ldflags "-s -w -X main.version=$(VERSION)" -o "$OUT_DIR/$arch_dir/wg-user" ./cmd/wg-user`（`VERSION` 从 `module.prop` 读，与现有 `Makefile` 的 `VERSION` 变量同源），且必须先 `go mod download`（在 `ROOT_DIR` 下，不再建临时模块）。`Makefile` 目标分工（CI 依赖这个划分）：`build: build-go`；`WPBINS/TNBINS` 换成 `GOWBINS := $(addprefix $(BIN)/,$(addsuffix /wg-user,$(ARCHS)))`；`test:` = `go vet ./... && go test ./...`；`verify:` = 所有脚本 `sh -n` + `sh test/shell/cli_test.sh` + `sh test/shell/install_test.sh`（不依赖 Go 工具链与已构建产物）；`build-go` 末尾加 `sh test/shell/build_test.sh`。`.gitignore` 用 `bin/*/wg-user` 替换两行旧规则，`etc/tunnel.conf` 改成 `etc/tunnel.conf*`。`.tool-versions` 增加一行 `golang 1.26.0`。`clean:` 改为 `rm -rf $(BIN)/*/wg-user $(BIN)/interop $(DIST)`；`PKG_FILES` 里删除 `etc/tunnel.conf.example`（文件本体由 Task 12 删除）。
 
 - [ ] **Step 4: 跑测试确认通过**
 
@@ -758,7 +758,7 @@ jj new
 
 - [ ] **Step 1: 改 CI**
 
-`build-go` job 增加 `actions/setup-go`（`go-version: '1.26'`），步骤顺序：`make test` → 下载钉死版本的 wstunnel 服务端（`curl ... v11.0.0 ... tar.gz` + `sha256sum -c`）→ `make interop` → `make build`（末尾自带 `sh test/shell/build_test.sh`）。`scripts` job：`make verify`（只需 shell，不需要 Go）；"No real configs are tracked" 检查改为 `etc/wireproxy.conf`、`etc/tunnel.conf*` 都不能被跟踪；删除 NDK wrapper 可执行性检查（wrapper 已删）。
+`build-go` job 增加 `actions/setup-go`（`go-version: '1.26.0'`），步骤顺序：`make test` → 下载钉死版本的 wstunnel 服务端（`curl ... v11.0.0 ... tar.gz` + `sha256sum -c`）→ `make interop` → `make build`（末尾自带 `sh test/shell/build_test.sh`）。`scripts` job：`make verify`（只需 shell，不需要 Go）；"No real configs are tracked" 检查改为 `etc/wireproxy.conf`、`etc/tunnel.conf*` 都不能被跟踪；删除 NDK wrapper 可执行性检查（wrapper 已删）。
 
 - [ ] **Step 2: 跑校验**
 

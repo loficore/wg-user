@@ -110,22 +110,35 @@ const Header = () => (
     </header>
 );
 
-type TransportState = 'connected' | 'reconnecting' | 'off' | 'unknown';
+type TransportState = 'connected' | 'connecting' | 'reconnecting' | 'off' | 'unknown';
 
-const TRANSPORT_STATES: readonly TransportState[] = ['connected', 'reconnecting', 'off', 'unknown'];
+// The state file carries the daemon's own words: connected, connecting,
+// reconnecting or closed for wstunnel, plus off when the transport is
+// disabled. `closed` is an Off transport in the UI, as is `off` itself;
+// anything else is unknown.
+const TRANSPORT_STATES = new Map<string, TransportState>([
+    ['connected', 'connected'],
+    ['connecting', 'connecting'],
+    ['reconnecting', 'reconnecting'],
+    ['closed', 'off'],
+    ['off', 'off'],
+]);
 
-// `status` prints `transport: <detail> (<state>)`; <detail> may be empty or contain brackets.
-const parseTransport = (lines: string[]): TransportState => {
+// `status` prints `transport: <detail> (<state>)`; <detail> may be empty or
+// contain brackets, and the paren-less `transport: unknown` form has none.
+const parseTransport = (lines: string[]): { state: TransportState; detail: string } => {
     const line = lines.find((l) => /^transport:\s*/.test(l));
-    const m = line?.match(/\((\w+)\)\s*$/);
-    const state = m?.[1];
-    return TRANSPORT_STATES.find((s) => s === state) ?? 'unknown';
+    const m = line?.match(/^transport:\s*(.*?)\s*\((\w+)\)\s*$/);
+    if (!m) return { state: 'unknown', detail: '' };
+    return { state: TRANSPORT_STATES.get(m[2]) ?? 'unknown', detail: m[1] };
 };
 
 const transportLabel = (state: TransportState | null): string => {
     switch (state) {
         case 'connected':
             return t('transport.connected');
+        case 'connecting':
+            return t('transport.connecting');
         case 'reconnecting':
             return t('transport.reconnecting');
         case 'off':
@@ -140,7 +153,7 @@ const transportLabel = (state: TransportState | null): string => {
 const Status = ({ refreshKey }: { refreshKey: number }) => {
     const [state, setState] = useState<'ok' | 'err' | 'loading'>('loading');
     const [meta, setMeta] = useState('');
-    const [transport, setTransport] = useState<TransportState | null>(null);
+    const [transport, setTransport] = useState<{ state: TransportState; detail: string } | null>(null);
 
     useEffect(() => {
         let cancelled = false;
@@ -155,12 +168,14 @@ const Status = ({ refreshKey }: { refreshKey: number }) => {
                     .filter((line) => line !== '');
                 setState(running ? 'ok' : 'err');
                 // Stopped means no transport line is printed; the transport is off.
-                setTransport(running ? parseTransport(lines) : 'off');
-                setMeta(lines.filter((line) => !/^last log:/.test(line)).join(' · '));
+                setTransport(running ? parseTransport(lines) : { state: 'off', detail: '' });
+                // The Transport row shows the state (and detail), so the status
+                // line must not repeat it; the log tail stays hidden as before.
+                setMeta(lines.filter((line) => !/^(?:last log:|transport:)/.test(line)).join(' · '));
             } catch (e) {
                 if (cancelled) return;
                 setState('err');
-                setTransport('unknown');
+                setTransport({ state: 'unknown', detail: '' });
                 setMeta(errorText(e));
             }
         };
@@ -187,7 +202,8 @@ const Status = ({ refreshKey }: { refreshKey: number }) => {
             </div>
             <div class="flex items-center text-xs mt-2">
                 <span class="text-slate-400 mr-2">{t('transport.label')}</span>
-                <span>{transportLabel(transport)}</span>
+                {transport?.detail && <span class="text-slate-400 mr-2 break-all">{transport.detail}</span>}
+                <span>{transportLabel(transport?.state ?? null)}</span>
             </div>
             <div class="text-slate-400 text-xs mt-1">{meta}</div>
         </Card>

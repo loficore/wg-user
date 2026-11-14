@@ -17,6 +17,7 @@ export const zh: Catalogue = {
 
     'transport.label': '传输',
     'transport.connected': '已连接',
+    'transport.connecting': '连接中',
     'transport.reconnecting': '重连中',
     'transport.off': '未启用',
     'transport.unknown': '未知',

@@ -19,6 +19,7 @@ export const en = {
 
     'transport.label': 'Transport',
     'transport.connected': 'Connected',
+    'transport.connecting': 'Connecting…',
     'transport.reconnecting': 'Reconnecting',
     'transport.off': 'Off',
     'transport.unknown': 'Unknown',

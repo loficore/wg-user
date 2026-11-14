@@ -49,7 +49,8 @@ type State struct {
 	// Transport is the active transport mode: "off" or "wstunnel".
 	Transport string
 	// TransportState is the transport's connection state: "connected",
-	// "connecting", "reconnecting" or "closed".
+	// "connecting", "reconnecting" or "closed" for wstunnel, plus "off" when
+	// the transport is disabled (Transport is then "off" too).
 	TransportState string
 	// TransportDetail is a human-readable detail for status output, normally
 	// the wstunnel URL or the direct endpoint. It must not contain a newline.

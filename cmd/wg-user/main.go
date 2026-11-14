@@ -170,7 +170,9 @@ func run(ctx context.Context, args []string, stderr io.Writer) int {
 	// file.
 	transport := cfg.Transport.Mode
 	detail := "udp"
-	transportState := "connected"
+	// off mode has no transport to connect: its state is "off", not one of the
+	// wstunnel client states, so status never claims a disabled transport is up.
+	transportState := "off"
 	var client *wstunnel.Client
 	var bind conn.Bind
 

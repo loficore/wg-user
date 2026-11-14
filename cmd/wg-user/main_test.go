@@ -211,8 +211,8 @@ func TestRealMain_WritesAndRemovesStateFile(t *testing.T) {
 	if got.Transport != config.ModeOff {
 		t.Errorf("state transport = %q, want %q", got.Transport, config.ModeOff)
 	}
-	if got.TransportState != "connected" {
-		t.Errorf("state transport_state = %q, want %q", got.TransportState, "connected")
+	if got.TransportState != "off" {
+		t.Errorf("state transport_state = %q, want %q", got.TransportState, "off")
 	}
 	if got.TransportDetail != "udp" {
 		t.Errorf("state transport_detail = %q, want %q", got.TransportDetail, "udp")

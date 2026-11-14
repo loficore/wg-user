@@ -97,8 +97,8 @@ func load(path string) (*Config, error) {
 // when the file has none, which means ModeOff with the documented defaults.
 //
 // Validation order is fixed so the first error a user sees is the most
-// actionable one: Mode → URL (wstunnel) → Path → Keepalive → Endpoint (wstunnel)
-// → peer count (wstunnel).
+// actionable one: Mode → URL (wstunnel) → Path → Keepalive → Endpoint (every
+// mode) → peer count (wstunnel).
 func parseTransport(section *ini.Section, wp *wireproxy.Configuration) (*Transport, error) {
 	tr := &Transport{
 		Mode:      ModeOff,
@@ -170,36 +170,35 @@ func parseTransport(section *ini.Section, wp *wireproxy.Configuration) (*Transpo
 		tr.Insecure = insecure
 	}
 
+	// Every [Peer] needs an Endpoint in every mode: off mode sends WG UDP
+	// straight to it, wstunnel mode hands it to the server as the delivery
+	// target. A peer without one can never handshake, so reject it here rather
+	// than at run time.
+	if err := validatePeerEndpoints(wp.Device.Peers); err != nil {
+		return nil, err
+	}
+
 	if tr.Mode != ModeWstunnel {
 		return tr, nil
 	}
 
-	if err := validateWstunnelPeer(wp); err != nil {
-		return nil, err
+	// One transport can only target one peer.
+	if n := len(wp.Device.Peers); n != 1 {
+		return nil, fmt.Errorf("transport mode %q requires exactly one [Peer], got %d", ModeWstunnel, n)
 	}
 
 	return tr, nil
 }
 
-// validateWstunnelPeer enforces that wstunnel mode has exactly one [Peer] and
-// that its Endpoint is set, since the transport uses it as the server-side
-// target and dereferences it.
-func validateWstunnelPeer(wp *wireproxy.Configuration) error {
-	// wireproxy.ParseConfig already rejects a file without [Peer], but index
-	// defensively so the checks below cannot panic.
-	peers := wp.Device.Peers
-	if len(peers) == 0 {
-		return fmt.Errorf("transport mode %q requires exactly one [Peer], got 0", ModeWstunnel)
+// validatePeerEndpoints requires a non-empty Endpoint on every peer, in every
+// mode. wireproxy.ParseConfig already validates the host:port form (and that
+// at least one [Peer] exists), so this only has to catch a missing value.
+func validatePeerEndpoints(peers []wireproxy.PeerConfig) error {
+	for i, peer := range peers {
+		if peer.Endpoint == nil || *peer.Endpoint == "" {
+			return fmt.Errorf("[Peer] Endpoint is required (peer %d)", i+1)
+		}
 	}
-
-	if peers[0].Endpoint == nil || *peers[0].Endpoint == "" {
-		return fmt.Errorf("[Peer] Endpoint is required when Mode = %q", ModeWstunnel)
-	}
-
-	if len(peers) != 1 {
-		return fmt.Errorf("transport mode %q requires exactly one [Peer], got %d", ModeWstunnel, len(peers))
-	}
-
 	return nil
 }
 

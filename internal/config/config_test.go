@@ -128,6 +128,13 @@ func TestLoad_IgnoresLegacyTunnelKeys(t *testing.T) {
 	}
 }
 
+// Endpoint is mandatory in every mode (spec §7.2): without it the datagrams
+// have nowhere to go and the peer can never handshake.
+func TestLoad_OffModeRequiresEndpoint(t *testing.T) {
+	_, err := Load("testdata/off-no-endpoint.conf")
+	wantErrContains(t, err, "[Peer] Endpoint is required")
+}
+
 // The single-peer rule belongs to wstunnel mode only; off mode must keep the
 // upstream tolerance for multi-peer configs.
 func TestLoad_OffModeAllowsMultiplePeers(t *testing.T) {

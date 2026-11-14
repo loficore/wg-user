@@ -8,12 +8,33 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/loficore/wg-user/internal/config"
 	"github.com/loficore/wg-user/internal/state"
 )
+
+// syncBuffer collects one of realMain's outputs. It is mutex-guarded because
+// with -v wireguard-go logs from several goroutines at once and bytes.Buffer
+// is not safe for concurrent writers.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
 
 // stageConfig copies src to <tmp>/etc/wireproxy.conf and returns the temp
 // module root and the config path. Pointing -c inside a temp module keeps the
@@ -40,11 +61,11 @@ func stageConfig(t *testing.T, src string) (root, configPath string) {
 
 // startRun starts realMain in a goroutine and returns the channel carrying its
 // exit code plus the captured output.
-func startRun(ctx context.Context, configPath string) (<-chan int, *bytes.Buffer, *bytes.Buffer) {
-	var stdout, stderr bytes.Buffer
+func startRun(ctx context.Context, args ...string) (<-chan int, *syncBuffer, *syncBuffer) {
+	var stdout, stderr syncBuffer
 	done := make(chan int, 1)
 	go func() {
-		done <- realMain(ctx, []string{"run", "-c", configPath}, &stdout, &stderr)
+		done <- realMain(ctx, args, &stdout, &stderr)
 	}()
 	return done, &stdout, &stderr
 }
@@ -67,8 +88,22 @@ func waitForFile(t *testing.T, path string, timeout time.Duration) {
 	}
 }
 
+// waitForExit waits for realMain to return and checks its exit code.
+func waitForExit(t *testing.T, done <-chan int, stdout, stderr *syncBuffer) int {
+	t.Helper()
+
+	select {
+	case code := <-done:
+		return code
+	case <-time.After(5 * time.Second):
+		t.Fatalf("realMain did not return within 5s; stdout: %s; stderr: %s",
+			stdout.String(), stderr.String())
+		return -1
+	}
+}
+
 func TestRealMain_ConfigtestOK(t *testing.T) {
-	var stdout, stderr bytes.Buffer
+	var stdout, stderr syncBuffer
 
 	code := realMain(context.Background(),
 		[]string{"configtest", "-c", "../../internal/config/testdata/minimal.conf"},
@@ -83,7 +118,7 @@ func TestRealMain_ConfigtestOK(t *testing.T) {
 }
 
 func TestRealMain_ConfigtestBadConfig(t *testing.T) {
-	var stdout, stderr bytes.Buffer
+	var stdout, stderr syncBuffer
 
 	code := realMain(context.Background(),
 		[]string{"configtest", "-c", "../../internal/config/testdata/transport-bad-mode.conf"},
@@ -98,7 +133,7 @@ func TestRealMain_ConfigtestBadConfig(t *testing.T) {
 }
 
 func TestRealMain_UnknownSubcommand(t *testing.T) {
-	var stdout, stderr bytes.Buffer
+	var stdout, stderr syncBuffer
 
 	code := realMain(context.Background(), []string{"frobnicate"}, &stdout, &stderr)
 
@@ -111,7 +146,7 @@ func TestRealMain_UnknownSubcommand(t *testing.T) {
 }
 
 func TestRealMain_MissingConfig(t *testing.T) {
-	var stdout, stderr bytes.Buffer
+	var stdout, stderr syncBuffer
 	missing := filepath.Join(t.TempDir(), "missing.conf")
 
 	code := realMain(context.Background(), []string{"configtest", "-c", missing}, &stdout, &stderr)
@@ -119,7 +154,7 @@ func TestRealMain_MissingConfig(t *testing.T) {
 	if code != 2 {
 		t.Fatalf("realMain() = %d, want 2", code)
 	}
-	if stderr.Len() == 0 {
+	if stderr.String() == "" {
 		t.Error("stderr is empty, want an error explaining the missing config")
 	}
 }
@@ -131,19 +166,17 @@ func TestRealMain_RunStopsOnContextCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	done, stdout, stderr := startRun(ctx, configPath)
+	done, stdout, stderr := startRun(ctx, "run", "-c", configPath)
 
 	waitForFile(t, statePath, 5*time.Second)
 	cancel()
 
-	select {
-	case code := <-done:
-		if code != 0 {
-			t.Fatalf("realMain() = %d, want 0; stdout: %s; stderr: %s",
-				code, stdout.String(), stderr.String())
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("realMain did not return within 5s of context cancellation")
+	if code := waitForExit(t, done, stdout, stderr); code != 0 {
+		t.Fatalf("realMain() = %d, want 0; stdout: %s; stderr: %s",
+			code, stdout.String(), stderr.String())
+	}
+	if got := stdout.String(); got != "" {
+		t.Errorf("stdout = %q, want empty", got)
 	}
 }
 
@@ -158,7 +191,7 @@ func TestRealMain_WritesAndRemovesStateFile(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	done, stdout, stderr := startRun(ctx, configPath)
+	done, stdout, stderr := startRun(ctx, "run", "-c", configPath)
 
 	// run must create the sibling run/ directory before its first write: the
 	// daemon can start before the shell has created it.
@@ -187,17 +220,76 @@ func TestRealMain_WritesAndRemovesStateFile(t *testing.T) {
 
 	cancel()
 
-	select {
-	case code := <-done:
-		if code != 0 {
-			t.Fatalf("realMain() = %d, want 0; stdout: %s; stderr: %s",
-				code, stdout.String(), stderr.String())
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("realMain did not return within 5s of context cancellation")
+	if code := waitForExit(t, done, stdout, stderr); code != 0 {
+		t.Fatalf("realMain() = %d, want 0; stdout: %s; stderr: %s",
+			code, stdout.String(), stderr.String())
 	}
 
 	if _, err := os.Stat(statePath); !errors.Is(err, fs.ErrNotExist) {
 		t.Errorf("os.Stat(%s) after shutdown = %v, want fs.ErrNotExist", statePath, err)
+	}
+}
+
+// TestRealMain_VerboseDeviceLogsGoToStderr pins the logger wiring end to end:
+// wireguard-go's lines must use the stderr realMain was given (with the
+// wg-user prefix) and must never reach stdout. wireguard-go's NewLogger, which
+// Create used to call, writes to the process's real stdout.
+func TestRealMain_VerboseDeviceLogsGoToStderr(t *testing.T) {
+	root, configPath := stageConfig(t, "testdata/off.conf")
+	statePath := filepath.Join(root, "run", "state")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done, stdout, stderr := startRun(ctx, "run", "-v", "-c", configPath)
+
+	waitForFile(t, statePath, 5*time.Second)
+	cancel()
+
+	if code := waitForExit(t, done, stdout, stderr); code != 0 {
+		t.Fatalf("realMain() = %d, want 0; stdout: %s; stderr: %s",
+			code, stdout.String(), stderr.String())
+	}
+	if got := stdout.String(); got != "" {
+		t.Errorf("stdout = %q, want empty", got)
+	}
+	if got := stderr.String(); !strings.Contains(got, "wg-user: UAPI: Updating private key") {
+		t.Errorf("stderr = %q, want it to contain %q", got, "wg-user: UAPI: Updating private key")
+	}
+}
+
+// TestNewLogger pins the -v gate: both callbacks are wired (wireguard-go picks
+// the level by which callbacks exist), so Verbosef itself must drop its lines
+// when -v is absent.
+func TestNewLogger(t *testing.T) {
+	tests := []struct {
+		name    string
+		verbose bool
+		want    string
+	}{
+		{
+			name:    "quiet drops verbose lines",
+			verbose: false,
+			want:    "wg-user: error 2\n",
+		},
+		{
+			name:    "verbose keeps both",
+			verbose: true,
+			want:    "wg-user: verbose 1\nwg-user: error 2\n",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var buf syncBuffer
+			logger := newLogger(&buf, tt.verbose)
+
+			logger.Verbosef("verbose %d", 1)
+			logger.Errorf("error %d", 2)
+
+			if got := buf.String(); got != tt.want {
+				t.Errorf("logger output = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }

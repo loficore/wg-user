@@ -157,10 +157,12 @@ func run(ctx context.Context, args []string, stderr io.Writer) int {
 		return exitUsage
 	}
 
-	logLevel := wgdevice.LogLevelError
-	if opts.verbose {
-		logLevel = wgdevice.LogLevelVerbose
-	}
+	// wireguard-go picks its level by which callbacks exist, so newLogger wires
+	// both and gates verbose output inside Verbosef. Both write to the stderr
+	// this process was given: wireguard-go's own NewLogger writes to the
+	// process's real stdout and decorates lines with ERROR/DEBUG and a
+	// timestamp, which would bypass the wg-user: prefix rule.
+	logger := newLogger(stderr, opts.verbose)
 
 	// Pick the transport before the device comes up: wireguard-go takes the
 	// conn.Bind at construction time. off mode is the kernel's UDP bind and
@@ -190,7 +192,7 @@ func run(ctx context.Context, args []string, stderr io.Writer) int {
 		bind = conn.NewDefaultBind()
 	}
 
-	vt, err := device.Create(cfg.WireProxy, bind, logLevel)
+	vt, err := device.Create(cfg.WireProxy, bind, logger)
 	if err != nil {
 		if client != nil {
 			client.Close()
@@ -203,10 +205,12 @@ func run(ctx context.Context, args []string, stderr io.Writer) int {
 		go routine.SpawnRoutine(vt)
 	}
 
-	// The supervisor gets a context of its own: cancelling ctx must not make
-	// Run close the transport while wireguard-go is still reading from it. The
-	// teardown below closes the device first, then stops this context.
-	clientCtx, stopClient := context.WithCancel(ctx)
+	// The supervisor's context is detached from ctx. Run's watchdog closes the
+	// client the moment its context ends, so inheriting the signal's
+	// cancellation would close the transport concurrently with — not after —
+	// vt.Dev.Close(). Only stopClient, called once the device is down, may end
+	// Run.
+	clientCtx, stopClient := context.WithCancel(context.WithoutCancel(ctx))
 	defer stopClient()
 
 	var (
@@ -281,8 +285,14 @@ func run(ctx context.Context, args []string, stderr io.Writer) int {
 
 	// Shutdown order is load-bearing: Dev.Close ends wireguard-go's receive
 	// routines and the bind's generation before the transport they read from
-	// goes away. Closing the client first would kill the receive path while
-	// the device still depends on it.
+	// goes away. Only after Dev.Close returns does stopClient end Run, whose
+	// watchdog closes the client.
+	//
+	// TODO: a permanent dial error (for example failed TLS certificate
+	// verification) is the one path cmd cannot order this way: Run closes the
+	// client itself before returning the error, so the transport goes first.
+	// That is acceptable because the process is already exiting — the receive
+	// routine merely stops early and nothing consumes it afterwards.
 	vt.Dev.Close()
 
 	if client != nil {
@@ -328,4 +338,25 @@ func writeState(path, transport, transportState, detail string) error {
 		TransportDetail: detail,
 		Updated:         time.Now(),
 	})
+}
+
+// newLogger builds wireguard-go's logger on w, which must be safe for
+// concurrent use because the device logs from several goroutines.
+//
+// Both callbacks are always non-nil: wireguard-go selects its log level by
+// which callbacks exist, so a nil Verbosef would be the only way to disable
+// verbose lines and would also make -v impossible to honour dynamically. The
+// level gate therefore lives inside Verbosef.
+func newLogger(w io.Writer, verbose bool) *wgdevice.Logger {
+	return &wgdevice.Logger{
+		Verbosef: func(format string, args ...any) {
+			if !verbose {
+				return
+			}
+			fmt.Fprintf(w, "wg-user: "+format+"\n", args...)
+		},
+		Errorf: func(format string, args ...any) {
+			fmt.Fprintf(w, "wg-user: "+format+"\n", args...)
+		},
+	}
 }

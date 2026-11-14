@@ -3,10 +3,14 @@
 // wireproxy VirtualTun that ties them to the parsed configuration.
 //
 // Create is derived from wireproxy v1.1.3 (ISC licensed) wireguard.go,
-// function StartWireguard. The single difference: the conn.Bind is a
-// parameter instead of being hard-coded to conn.NewDefaultBind(), so the same
-// stack can run over the kernel's UDP sockets (Mode = off) or over the
-// wstunnel WebSocket (Mode = wstunnel).
+// function StartWireguard. It differs in four ways: the conn.Bind is a
+// parameter instead of being hard-coded to conn.NewDefaultBind(), the
+// *device.Logger is a parameter instead of being built here, errors are
+// wrapped with a "device:" prefix, and every failure after the device exists
+// closes it before returning. The bind parameter lets the same stack run over
+// the kernel's UDP sockets (Mode = off) or over the wstunnel WebSocket
+// (Mode = wstunnel); the logger parameter lets the CLI send wireguard-go's
+// output to the same writer as its own.
 package device
 
 import (
@@ -20,9 +24,10 @@ import (
 )
 
 // Create builds a netstack TUN from conf and brings a wireguard-go device up
-// on it, using bind for the WireGuard datagrams. logLevel is a wireguard-go
-// device.LogLevel* constant; the logger writes under the "wg-user: " prefix.
-func Create(conf *wireproxy.Configuration, bind conn.Bind, logLevel int) (*wireproxy.VirtualTun, error) {
+// on it, using bind for the WireGuard datagrams and logger for every
+// wireguard-go log line. The caller owns the logger: Create only wires it into
+// the device, so its destination, prefix and level are the caller's policy.
+func Create(conf *wireproxy.Configuration, bind conn.Bind, logger *wgdevice.Logger) (*wireproxy.VirtualTun, error) {
 	deviceConf := conf.Device
 
 	setting, err := wireproxy.CreateIPCRequest(deviceConf)
@@ -37,7 +42,7 @@ func Create(conf *wireproxy.Configuration, bind conn.Bind, logLevel int) (*wirep
 
 	// From here on the device owns the TUN, so dev.Close is the only cleanup
 	// path that matters: it tears down the routines, the bind and the TUN.
-	dev := wgdevice.NewDevice(tun, bind, wgdevice.NewLogger(logLevel, "wg-user: "))
+	dev := wgdevice.NewDevice(tun, bind, logger)
 
 	if err := dev.IpcSet(setting.IpcRequest); err != nil {
 		dev.Close()

@@ -106,6 +106,11 @@ type Client struct {
 	// it nil.
 	beforePublish func()
 
+	// beforeDialFailed is a test-only seam invoked by dialFailed after its
+	// fast-path shutdown check and before it takes mu, so tests can land a
+	// Close exactly in that window. Production leaves it nil.
+	beforeDialFailed func()
+
 	// writeMu serialises writes: gorilla allows one concurrent writer per
 	// connection, and every write must set a deadline via writeFrame. Lock
 	// order is writeMu → mu; nothing takes them the other way.
@@ -575,14 +580,18 @@ func (c *Client) dialFailed() {
 	default:
 	}
 
+	if c.beforeDialFailed != nil {
+		c.beforeDialFailed()
+	}
+
 	// The idle check and the state change are atomic with respect to a
 	// concurrent successful dial, which publishes conn and "connected" under
-	// the same lock.
+	// the same lock. setOpenState re-checks done under stateMu, so a Close that
+	// completed between the fast-path check above and this lock still leaves
+	// "closed" terminal.
 	c.mu.Lock()
 	if c.conn == nil {
-		c.stateMu.Lock()
-		c.state = stateReconnecting
-		c.stateMu.Unlock()
+		c.setOpenState(stateReconnecting)
 	}
 	c.mu.Unlock()
 }

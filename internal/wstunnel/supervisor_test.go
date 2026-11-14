@@ -387,3 +387,18 @@ func TestBackoff_JittersWithinBoundsAndCaps(t *testing.T) {
 		}
 	}
 }
+
+func TestDialFailed_CloseDuringFailureKeepsClosedState(t *testing.T) {
+	c := New(Config{Target: "10.0.0.2:51820"})
+
+	// Close must win even when it completes entirely between dialFailed's
+	// fast-path shutdown check and its state update: "closed" is terminal and
+	// nothing may report "reconnecting" afterwards.
+	c.beforeDialFailed = func() { _ = c.Close() }
+
+	c.dialFailed()
+
+	if got := c.State(); got != "closed" {
+		t.Errorf("State after a racy dial failure = %q, want %q", got, "closed")
+	}
+}

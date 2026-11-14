@@ -381,7 +381,8 @@ jj new
 func TestCreate_ReturnsUsableVirtualTun(t *testing.T) {
 	cfg, err := config.Load("../config/testdata/minimal.conf")
 	vt, err := Create(cfg.WireProxy, conn.NewDefaultBind(), device.LogLevelSilent)
-	// 断言 vt != nil, vt.Tnet != nil, vt.Dev != nil, vt.SystemDNS == false（配置里有 DNS）
+	// 断言 vt != nil, vt.Tnet != nil, vt.Dev != nil, vt.SystemDNS == true（minimal.conf 无 DNS）
+	// 另用一个带 DNS 的 fixture（internal/device/testdata/dns.conf）断言 SystemDNS == false
 	// cleanup: vt.Dev.Close()
 }
 

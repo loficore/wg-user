@@ -277,7 +277,11 @@ Expected: FAIL（`Run` 未定义）
 
 - [ ] **Step 3: 实现 `Run`**
 
-循环：置状态 `connecting` → `dialOnce` → 成功后置 `connected` → 启动读协程（读到帧就投 `inbox`，出错则关闭连接）→ 启动 ping ticker（`Keepalive > 0`）→ 等待"连接结束或 ctx 取消" → 置 `reconnecting` → 退避（`BackoffMin` 起，×2，封顶 `BackoffMax`，±20% 抖动）→ 重试。所有写操作（数据帧、Ping/Pong）都在同一把写锁下，读协程只读。`ctx` 取消时关闭连接并返回 `nil`。
+循环：置状态 `connecting` → **用有界 context 调 `dialOnce`**（`context.WithTimeout(ctx, 10*time.Second)`，因为 `dialOnce` 自身没有握手超时）→ 成功后置 `connected` → 启动 ping ticker（`Keepalive > 0`，ping 走与数据帧相同的 `writeFrame` 路径，因此同样受写超时约束）→ 等待"本代连接结束或 ctx 取消" → 置 `reconnecting` → 退避（`BackoffMin` 起，×2，封顶 `BackoffMax`，±20% 抖动；一次成功连接后重置为 `BackoffMin`）→ 重试。
+
+**读协程的所有权**：`dialOnce` 已经启动并独占本连接的读协程（gorilla 禁止同一连接上并发 `ReadMessage`）。`Run` **绝不能**再启动读协程；它只等待本代连接结束 —— 在 `dialOnce` 返回后于 `mu` 下快照本代的错误通道（`readErrCh`），然后 `select` 该通道与 `ctx.Done()`。通道在本代连接退役时关闭（由 `failConn` 完成），所以"连接结束"就是它可读。
+
+`ctx` 取消时关闭连接并返回 `nil`。
 
 **永久性错误不重试**：`dialOnce` 返回的 TLS 证书校验错误（`errors.As` 到 `*tls.CertificateVerificationError`、`x509.UnknownAuthorityError`、`x509.HostnameError`、`x509.CertificateInvalidError`）表示配置/证书问题，`Run` 立即把它返回给调用方（`cmd` 打印后以退出码 1 结束）。
 

@@ -67,6 +67,10 @@ jobs:
         run: pnpm run check
 
       - name: The committed bundle matches the sources
+        # Dependabot can bump a dev dependency but cannot rebuild the
+        # committed bundle; the release workflow rebuilds webroot/ from
+        # source anyway, so don't fail dependency PRs on this.
+        if: github.actor != 'dependabot[bot]'
         working-directory: .
         run: |
           if ! git diff --exit-code -- webroot/; then

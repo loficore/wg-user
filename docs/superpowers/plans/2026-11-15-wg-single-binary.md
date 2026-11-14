@@ -610,7 +610,7 @@ Expected: FAIL（`missing bin/arm64-v8a/wg-user`）
 
 - [ ] **Step 3: 重写 `scripts/build.sh`、改 `Makefile`/`.gitignore`/`.tool-versions`、删 Rust 资产**
 
-`scripts/build.sh` 保留现有 `TARGETS` 映射与 `GOPROXY` 默认，循环体改为 `go build -trimpath -ldflags "-s -w -X main.version=$(VERSION)" -o "$OUT_DIR/$arch_dir/wg-user" ./cmd/wg-user`（`VERSION` 从 `module.prop` 读，与现有 `Makefile` 的 `VERSION` 变量同源），且必须先 `go mod download`（在 `ROOT_DIR` 下，不再建临时模块）。`Makefile` 目标分工（CI 依赖这个划分）：`build: build-go`；`WPBINS/TNBINS` 换成 `GOWBINS := $(addprefix $(BIN)/,$(addsuffix /wg-user,$(ARCHS)))`；`test:` = `go vet ./... && go test ./...`；`verify:` = 所有脚本 `sh -n` + `sh test/shell/cli_test.sh` + `sh test/shell/install_test.sh`（不依赖 Go 工具链与已构建产物）；`build-go` 末尾加 `sh test/shell/build_test.sh`。`.gitignore` 用 `bin/*/wg-user` 替换两行旧规则，`etc/tunnel.conf` 改成 `etc/tunnel.conf*`。`.tool-versions` 增加一行 `golang 1.26.0`。`clean:` 改为 `rm -rf $(BIN)/*/wg-user $(BIN)/interop $(DIST)`；`PKG_FILES` 里删除 `etc/tunnel.conf.example`（文件本体由 Task 12 删除）。
+`scripts/build.sh` 保留现有 `TARGETS` 映射与 `GOPROXY` 默认，循环体改为 `go build -trimpath -ldflags "-s -w -X main.version=$(VERSION)" -o "$OUT_DIR/$arch_dir/wg-user" ./cmd/wg-user`（`VERSION` 从 `module.prop` 读，与现有 `Makefile` 的 `VERSION` 变量同源），且必须先 `go mod download`（在 `ROOT_DIR` 下，不再建临时模块）。`Makefile` 目标分工（CI 依赖这个划分）：`build: build-go`；`WPBINS/TNBINS` 换成 `GOWBINS := $(addprefix $(BIN)/,$(addsuffix /wg-user,$(ARCHS)))`；`test:` = `go vet ./... && go test ./...`；`verify:` = 所有脚本 `sh -n` + `sh test/shell/cli_test.sh` + `sh test/shell/install_test.sh`（不依赖 Go 工具链与已构建产物）；`build-go` 末尾加 `sh test/shell/build_test.sh`。`.gitignore` 用 `bin/*/wg-user` 替换两行旧规则，`etc/tunnel.conf` 改成 `etc/tunnel.conf*`。`.tool-versions` 增加一行 `golang 1.26.5`（asdf 只接受精确版本；`go.mod` 的 `1.26.0` 是语言下限，钉最旧的补丁级会把所有人拽回旧工具链）。`clean:` 改为 `rm -rf $(BIN)/*/wg-user $(BIN)/interop $(DIST)`，并且**不**调用 `webui-clean`——`webroot/{app.js,index.html,style.css}` 是已跟踪、随包发布的产物，`clean` 删掉它们会在 jj 自动快照里变成删除记录。`package`/`package-only` 归档前先校验四个 `$(GOWBINS)` 都是可执行普通文件，否则报错退出（`zip` 对缺失条目返回 0，会静默产出空 `bin/<arch>` 的包）。`PKG_FILES` 里删除 `etc/tunnel.conf.example`（文件本体由 Task 12 删除）。
 
 - [ ] **Step 4: 跑测试确认通过**
 
@@ -769,7 +769,7 @@ jj new
 
 - [ ] **Step 1: 改 CI**
 
-`build-go` job 增加 `actions/setup-go`（`go-version: '1.26.0'`），步骤顺序：`make test` → 下载钉死版本的 wstunnel 服务端（`wstunnel_11.0.0_linux_amd64.tar.gz` + `sha256sum -c` + `chmod +x`）→ `make interop` → `make build`（末尾自带 `sh test/shell/build_test.sh`）。`scripts` job：`make verify`（只需 shell，不需要 Go）；"No real configs are tracked" 检查改为 `etc/wireproxy.conf`、`etc/tunnel.conf*` 都不能被跟踪；删除 NDK wrapper 可执行性检查（wrapper 已删）。
+`build-go` job 增加 `actions/setup-go`（`go-version: '1.26.x'`，取该系列最新补丁），步骤顺序：`make test` → 下载钉死版本的 wstunnel 服务端（`wstunnel_11.0.0_linux_amd64.tar.gz` + `sha256sum -c` + `chmod +x`）→ `make interop` → `make build`（末尾自带 `sh test/shell/build_test.sh`）。`scripts` job：`make verify`（只需 shell，不需要 Go）；"No real configs are tracked" 检查改为 `etc/wireproxy.conf`、`etc/tunnel.conf*` 都不能被跟踪；删除 NDK wrapper 可执行性检查（wrapper 已删）。
 
 - [ ] **Step 2: 跑校验**
 

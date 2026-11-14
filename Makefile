@@ -19,7 +19,7 @@ WEBROOT := $(ROOT_DIR)/webroot
 # the copy already on the device).
 PKG_FILES := module.prop customize.sh uninstall.sh sepolicy.rule service.sh wg-user common/ etc/wireproxy.conf.example webroot/ bin/arm64-v8a bin/armeabi-v7a bin/x86_64 bin/x86 README.md LICENSE docs/INSTALL.md docs/CONFIG.md docs/TUNNEL-SERVER.md docs/CHANGELOG.md docs/ARCHITECTURE.md
 
-.PHONY: build build-go test webui webui-clean clean package package-only verify interop help FORCE
+.PHONY: build build-go test webui webui-clean clean check-bins package package-only verify interop help FORCE
 
 help:
 	@echo "make build      - cross-compile the single wg-user binary for 4 arches"
@@ -56,11 +56,29 @@ webui:
 webui-clean:
 	rm -f $(WEBROOT)/app.js $(WEBROOT)/index.html $(WEBROOT)/style.css
 
+# NOTE: this deliberately does not run webui-clean. webroot/app.js, index.html
+# and style.css are tracked in git and shipped in the module zip, and make build
+# does not regenerate them, so wiping them here would record three deletions of
+# files the module cannot do without. Rebuild the bundle explicitly with
+# `make webui` (or `make webui-clean` to drop it on purpose).
 clean:
 	rm -rf $(BIN)/*/wg-user $(BIN)/interop $(DIST)
-	$(MAKE) webui-clean
 
-package: build webui
+# zip exits 0 when a named entry is missing, it just leaves it out — so a
+# package run after `make clean` would "succeed" with empty bin/<arch>/ dirs.
+# Refuse to build an archive unless all four cross-compiles are present.
+check-bins:
+	@missing=""; \
+	for b in $(GOWBINS); do \
+	    if [ ! -f "$$b" ] || [ ! -x "$$b" ]; then missing="$$missing $$b"; fi; \
+	done; \
+	if [ -n "$$missing" ]; then \
+	    echo "ERROR: cannot package, missing wg-user binaries:$$missing"; \
+	    echo "       run 'make build' first (or 'make package', which builds)."; \
+	    exit 1; \
+	fi
+
+package: build check-bins webui
 	@echo "==> packaging wg-user v$(VERSION)..."
 	@mkdir -p $(DIST)
 	@cd $(ROOT_DIR) && zip -r $(DIST)/wg-user-$(VERSION).zip $(PKG_FILES) 2>/dev/null || \
@@ -69,7 +87,7 @@ package: build webui
 
 # Same archive, but without re-running the cross-compiles. Use after
 # touching only webui/ or docs/.
-package-only: webui
+package-only: check-bins webui
 	@echo "==> packaging wg-user v$(VERSION) (no rebuild)..."
 	@mkdir -p $(DIST)
 	@cd $(ROOT_DIR) && zip -r $(DIST)/wg-user-$(VERSION).zip $(PKG_FILES) 2>/dev/null || \

@@ -550,8 +550,8 @@ func TestInterop_TargetOutsideRestrictIsDropped(t *testing.T) {
 Run:
 ```bash
 mkdir -p bin/interop && curl -fsSL -o /tmp/wstunnel.tar.gz \
-  https://github.com/erebe/wstunnel/releases/download/v11.0.0/wstunnel-v11.0.0-x86_64-unknown-linux-gnu.tar.gz \
-  && tar -xzf /tmp/wstunnel.tar.gz -C bin/interop wstunnel
+  https://github.com/erebe/wstunnel/releases/download/v11.0.0/wstunnel_11.0.0_linux_amd64.tar.gz \
+  && tar -xzf /tmp/wstunnel.tar.gz -C bin/interop wstunnel && chmod +x bin/interop/wstunnel
 WSTUNNEL_SERVER_BIN=$PWD/bin/interop/wstunnel go test -tags interop ./internal/wstunnel -run Interop -v
 ```
 Expected: FAIL（`make interop` 目标未定义前先看到测试本身跑不通或连接失败）
@@ -769,7 +769,7 @@ jj new
 
 - [ ] **Step 1: 改 CI**
 
-`build-go` job 增加 `actions/setup-go`（`go-version: '1.26.0'`），步骤顺序：`make test` → 下载钉死版本的 wstunnel 服务端（`curl ... v11.0.0 ... tar.gz` + `sha256sum -c`）→ `make interop` → `make build`（末尾自带 `sh test/shell/build_test.sh`）。`scripts` job：`make verify`（只需 shell，不需要 Go）；"No real configs are tracked" 检查改为 `etc/wireproxy.conf`、`etc/tunnel.conf*` 都不能被跟踪；删除 NDK wrapper 可执行性检查（wrapper 已删）。
+`build-go` job 增加 `actions/setup-go`（`go-version: '1.26.0'`），步骤顺序：`make test` → 下载钉死版本的 wstunnel 服务端（`wstunnel_11.0.0_linux_amd64.tar.gz` + `sha256sum -c` + `chmod +x`）→ `make interop` → `make build`（末尾自带 `sh test/shell/build_test.sh`）。`scripts` job：`make verify`（只需 shell，不需要 Go）；"No real configs are tracked" 检查改为 `etc/wireproxy.conf`、`etc/tunnel.conf*` 都不能被跟踪；删除 NDK wrapper 可执行性检查（wrapper 已删）。
 
 - [ ] **Step 2: 跑校验**
 

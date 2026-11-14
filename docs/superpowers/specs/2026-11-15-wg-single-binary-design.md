@@ -91,6 +91,7 @@ internal/state/state.go         run/state 原子写入（供 wg-user status / We
   - `Sec-WebSocket-Protocol: v1, authorization.bearer.<jwt>`
   - 若配置了 `Username`/`Password`：`Authorization: Basic <base64(user:pass)>`
 - TLS：`Insecure = true` → `tls.Config{InsecureSkipVerify: true}`；否则按 URL 主机名做正常校验。
+- **帧掩码（部署硬要求）**：客户端按 RFC 6455 给每个发送帧加掩码；wstunnel v11 服务端**只有在启动时带 `--websocket-mask-frame` 才会解掩码**（`config.rs` 中该值默认 `false`）。漏掉该 flag 时握手、路径、JWT 全部正常，但每个数据报会以 4 字节掩码异或后的形式交给 UDP —— WG 永远握手不上，且没有任何错误信息。服务端启动方式见 `docs/TUNNEL-SERVER.md`。
 
 ### 5.2 JWT
 
@@ -333,7 +334,11 @@ Release workflow：删除 Rust 构建步骤；`make package` 产出 `wg-user-<ve
 
 全新安装：只从 `*.example` 播种 `etc/wireproxy.conf`（含 `[Transport]` 段，`Mode = off`）。
 
-### 12.2 回滚
+### 12.2 服务端升级动作（0.3.0 必做）
+
+客户端的帧掩码行为没有变化（一直是 RFC 6455 合规的掩码客户端），但 0.3.0 起把这条要求显式化：VPS 上的 `wstunnel server` 启动命令必须带 `--websocket-mask-frame`。不加该 flag 时握手成功、数据面静默全损。做法与命令见 `docs/TUNNEL-SERVER.md`。
+
+### 12.3 回滚
 
 保留 0.2.0 的 release zip 与 `etc/tunnel.conf.migrated`。回滚步骤：改名 `tunnel.conf.migrated → tunnel.conf`，重装 0.2.0。`[Transport]` section 会被 0.2.0 的 wireproxy 忽略，因此同一个 `wireproxy.conf` 在回滚后仍可读。
 
@@ -343,6 +348,7 @@ Release workflow：删除 Rust 构建步骤；`make package` 产出 `wg-user-<ve
 |---|---|---|
 | wstunnel 服务端升级改了私有握手/帧格式 | 传输全断 | VPS 版本钉死 v11.0.0；CI 互通测试；升级服务端前必须先过该测试；文档写明 |
 | 自定义 `conn.Bind` 与 wireguard-go 语义不符 | 握手失败、数据面不通 | 互通测试覆盖真实 UDP 往返；`Mode = off` 作为对照路径；设备端验收清单 |
+| 服务端漏加 `--websocket-mask-frame` | 握手正常但每个数据报被掩码异或，数据面静默全损 | 文档（TUNNEL-SERVER/CONFIG）与 CHANGELOG 升级说明强提示；互通测试固定带该 flag 并在代码注释里说明原因 |
 | WSTUNNEL_SERVER_BIN 在 CI 下载失败 | CI 红 | 钉死版本 + sha256；失败明确报错，避免静默跳过 |
 | wireproxy 上游 API 变化 | 编译失败 | `go.mod` 钉死 v1.1.3；升级时由 CI 编译 + 单测把关 |
 | Go 1.26 工具链要求 | 本地/CI 构建失败 | `.tool-versions` 与 CI `setup-go` 固定 1.26 |

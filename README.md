@@ -113,6 +113,26 @@ release silently does not.
 `workflow_dispatch` on the release workflow runs the same build without
 creating a release — useful for verifying the toolchain.
 
+## Contributing
+
+`main` is protected:
+
+- direct pushes are rejected (including for the owner);
+- a pull request only becomes mergeable once all three CI jobs are green
+  **and** the branch is up to date with `main`;
+- force-pushes and branch deletion are disabled.
+
+```bash
+jj new main                        # start from main
+# ...edit...
+jj bookmark create my-change -r @
+jj git push --bookmark my-change
+gh pr create --base main --head my-change --fill
+```
+
+Tags are not covered by branch protection, so pushing a release tag
+directly is still the release trigger.
+
 ## License
 
 ISC. See [`LICENSE`](LICENSE). Bundled wireproxy is also ISC.

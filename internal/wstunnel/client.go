@@ -46,12 +46,14 @@ const (
 	// own, so the supervisor wraps every attempt.
 	defaultDialTimeout = 10 * time.Second
 
-	// State values reported by State. Before the first successful dial the
-	// client is "connecting"; a failed dial or a dropped connection is
-	// "reconnecting"; a live WebSocket is "connected".
+	// State values reported by State: "connecting" while an attempt is in
+	// progress, "connected" while a live WebSocket is published,
+	// "reconnecting" while waiting to retry after a failure, and "closed"
+	// once Close has been called (nothing will reconnect).
 	stateConnecting   = "connecting"
 	stateConnected    = "connected"
 	stateReconnecting = "reconnecting"
+	stateClosed       = "closed"
 )
 
 // Config configures a Client. It is a copy of the keys the [Transport]
@@ -83,6 +85,9 @@ type Config struct {
 //
 // A Client is safe for concurrent use. Send may be called while the reader is
 // active; the reconnect supervisor may replace the connection underneath it.
+// State reports one of "connecting" (an attempt is in progress), "connected"
+// (a live WebSocket is published), "reconnecting" (waiting to retry after a
+// failure) or "closed" (Close was called; nothing will reconnect).
 //
 // gorilla permits exactly one reader and one writer per connection. dialOnce
 // is the only code that starts a reader, and Clients serialise all writes
@@ -177,14 +182,11 @@ func (c *Client) Run(ctx context.Context) error {
 		}
 	}()
 
-	// stop ends the supervisor. Nothing is live once Run returns, so it closes
-	// the client and reports the shutdown state.
+	// stop ends the supervisor: every exit is terminal, so it tears the client
+	// down before returning. Close publishes "closed", which is what State
+	// reports from then on.
 	stop := func() error {
 		c.Close()
-		// "connecting" is reserved for the window before the first dial;
-		// after a session there is no live connection, which is what
-		// "reconnecting" reports (without a supervisor behind it).
-		c.setState(stateReconnecting)
 		return nil
 	}
 
@@ -195,8 +197,9 @@ func (c *Client) Run(ctx context.Context) error {
 
 		// No connection is published while dialing. A failed dial publishes
 		// "reconnecting" from dialFailed; a successful one publishes
-		// "connected" from dialOnce.
-		c.setState(stateConnecting)
+		// "connected" from dialOnce. setOpenState keeps "closed" terminal if a
+		// concurrent Close wins this race.
+		c.setOpenState(stateConnecting)
 
 		// dialOnce has no handshake timeout of its own, so bound each attempt:
 		// a peer that accepts TCP and then stalls must not wedge the
@@ -213,7 +216,10 @@ func (c *Client) Run(ctx context.Context) error {
 				return stop()
 			case isPermanentDialError(err):
 				// Certificate problems are configuration errors: retrying can
-				// never succeed, so hand the error to the caller.
+				// never succeed. Tear the client down like any other exit —
+				// Send/Recv/State must not keep behaving as if a supervisor
+				// were still reconnecting — then hand the error to the caller.
+				_ = stop()
 				return err
 			}
 			// Transient failure: back off and retry.
@@ -393,7 +399,8 @@ func (c *Client) Recv(buf []byte) (int, error) {
 	}
 }
 
-// Close tears down the connection. It is idempotent, and Recv afterwards
+// Close tears down the connection and is terminal: afterwards State reports
+// "closed" and nothing will reconnect. It is idempotent, and Recv afterwards
 // reports net.ErrClosed. It never blocks on an in-flight write: the write
 // deadline and the socket close both release the writer.
 func (c *Client) Close() error {
@@ -413,12 +420,17 @@ func (c *Client) Close() error {
 			_ = conn.Close()
 		}
 	})
+
+	// Outside the once so a repeated Close still ends in the terminal state:
+	// a supervisor that raced this call may have published "connecting".
+	c.setState(stateClosed)
 	return nil
 }
 
-// State returns the connection state: "connecting" before the first
-// successful dial, "connected" while the WebSocket is live, and "reconnecting"
-// after a dial failure, a dropped connection, or once Run has returned.
+// State returns the connection state: "connecting" while an attempt is in
+// progress, "connected" while a live WebSocket is published, "reconnecting"
+// while waiting to retry after a failure, and "closed" once Close has been
+// called (nothing will reconnect).
 func (c *Client) State() string {
 	c.stateMu.RLock()
 	defer c.stateMu.RUnlock()
@@ -428,6 +440,18 @@ func (c *Client) State() string {
 func (c *Client) setState(state string) {
 	c.stateMu.Lock()
 	c.state = state
+	c.stateMu.Unlock()
+}
+
+// setOpenState publishes state unless the client is already closed, so
+// "closed" stays terminal even when the supervisor's state write races Close.
+func (c *Client) setOpenState(state string) {
+	c.stateMu.Lock()
+	select {
+	case <-c.done:
+	default:
+		c.state = state
+	}
 	c.stateMu.Unlock()
 }
 

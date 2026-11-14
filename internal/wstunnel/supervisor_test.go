@@ -132,8 +132,8 @@ func TestRun_ReconnectsAfterServerClose(t *testing.T) {
 	if err := h.stop(); err != nil {
 		t.Fatalf("Run returned %v, want nil", err)
 	}
-	if got := c.State(); got != "reconnecting" && got != "connecting" {
-		t.Errorf("State after Run = %q, want reconnecting or connecting", got)
+	if got := c.State(); got != "closed" {
+		t.Errorf("State after Run = %q, want %q", got, "closed")
 	}
 }
 
@@ -277,8 +277,8 @@ func TestRun_StopsOnContextCancel(t *testing.T) {
 	if elapsed := time.Since(start); elapsed > time.Second {
 		t.Errorf("Run took %v to return after cancellation", elapsed)
 	}
-	if got := c.State(); got != "reconnecting" && got != "connecting" {
-		t.Errorf("State after Run = %q, want reconnecting or connecting", got)
+	if got := c.State(); got != "closed" {
+		t.Errorf("State after cancellation = %q, want %q", got, "closed")
 	}
 
 	// A cancelled Run closes the client, so its Close contract holds without
@@ -343,8 +343,22 @@ func TestRun_ReturnsFatalOnCertificateError(t *testing.T) {
 	if n := handlers.Load(); n != 0 {
 		t.Errorf("TLS server handlers ran %d times, want 0 (verification must fail first)", n)
 	}
-	if got := c.State(); got != "reconnecting" && got != "connecting" {
-		t.Errorf("State after a fatal dial error = %q, want reconnecting or connecting", got)
+	if got := c.State(); got != "closed" {
+		t.Errorf("State after a fatal dial error = %q, want %q", got, "closed")
+	}
+
+	// The fatal path must tear the client down like any other exit: Recv
+	// reports net.ErrClosed instead of parking on a connection that will never
+	// come back.
+	recvDone := make(chan error, 1)
+	go func() { _, err := c.Recv(make([]byte, 8)); recvDone <- err }()
+	select {
+	case err := <-recvDone:
+		if !errors.Is(err, net.ErrClosed) {
+			t.Errorf("Recv after a fatal Run = %v, want net.ErrClosed", err)
+		}
+	case <-time.After(time.Second):
+		t.Error("Recv stayed blocked after a fatal Run, want net.ErrClosed")
 	}
 }
 

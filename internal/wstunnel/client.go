@@ -3,7 +3,10 @@ package wstunnel
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
+	"errors"
 	"fmt"
+	"math/rand"
 	"net"
 	"net/http"
 	"net/url"
@@ -38,6 +41,10 @@ const (
 	// defaultWriteTimeout bounds every WebSocket write. Without it a peer
 	// that stops reading TCP would pin the writer forever.
 	defaultWriteTimeout = 10 * time.Second
+
+	// defaultDialTimeout bounds one handshake. dialOnce has no timeout of its
+	// own, so the supervisor wraps every attempt.
+	defaultDialTimeout = 10 * time.Second
 
 	// State values reported by State. Before the first successful dial the
 	// client is "connecting"; a failed dial or a dropped connection is
@@ -145,6 +152,164 @@ func New(cfg Config) *Client {
 	}
 }
 
+// Run supervises the connection until ctx is cancelled: it dials, keeps the
+// published WebSocket alive with pings, and redials with exponential backoff
+// whenever the connection ends. It returns nil after ctx cancellation — a
+// signal is a clean exit for the CLI — but returns a permanent dial error,
+// such as a TLS certificate verification failure, without retrying.
+//
+// Run owns the reconnect policy only. dialOnce owns each connection's single
+// reader, so Run waits for the current generation's error channel to close and
+// never starts a read goroutine of its own.
+func (c *Client) Run(ctx context.Context) error {
+	backoff := c.backoffFloor()
+
+	// A cancelled context must also release a write stuck on a peer that
+	// stopped reading: without this, Run could sit inside a ping for the whole
+	// write timeout. Close is idempotent, so racing stop is harmless.
+	finished := make(chan struct{})
+	defer close(finished)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = c.Close()
+		case <-finished:
+		}
+	}()
+
+	// stop ends the supervisor. Nothing is live once Run returns, so it closes
+	// the client and reports the shutdown state.
+	stop := func() error {
+		c.Close()
+		// "connecting" is reserved for the window before the first dial;
+		// after a session there is no live connection, which is what
+		// "reconnecting" reports (without a supervisor behind it).
+		c.setState(stateReconnecting)
+		return nil
+	}
+
+	for {
+		if ctx.Err() != nil {
+			return stop()
+		}
+
+		// No connection is published while dialing. A failed dial publishes
+		// "reconnecting" from dialFailed; a successful one publishes
+		// "connected" from dialOnce.
+		c.setState(stateConnecting)
+
+		// dialOnce has no handshake timeout of its own, so bound each attempt:
+		// a peer that accepts TCP and then stalls must not wedge the
+		// supervisor.
+		dialCtx, cancel := context.WithTimeout(ctx, defaultDialTimeout)
+		err := c.dialOnce(dialCtx)
+		cancel()
+
+		if err != nil {
+			switch {
+			case ctx.Err() != nil, errors.Is(err, net.ErrClosed):
+				// The attempt was cancelled, or the client was closed from
+				// outside Run; neither is an error.
+				return stop()
+			case isPermanentDialError(err):
+				// Certificate problems are configuration errors: retrying can
+				// never succeed, so hand the error to the caller.
+				return err
+			}
+			// Transient failure: back off and retry.
+		} else {
+			// A successful connection resets the backoff so the next drop
+			// retries promptly.
+			backoff = c.backoffFloor()
+
+			// The reader belongs to dialOnce; Run only waits for this
+			// generation to retire. failConn closes the channel, and a
+			// connection that died before this snapshot leaves it already
+			// closed, so both cases read as "the connection ended".
+			c.mu.Lock()
+			errCh := c.readErrCh
+			c.mu.Unlock()
+
+			var ticker *time.Ticker
+			var ping <-chan time.Time
+			if c.cfg.Keepalive > 0 {
+				ticker = time.NewTicker(c.cfg.Keepalive)
+				ping = ticker.C
+			}
+
+			c.waitConn(ctx, errCh, ping)
+
+			if ticker != nil {
+				ticker.Stop()
+			}
+
+			if ctx.Err() != nil {
+				return stop()
+			}
+			select {
+			case <-c.done:
+				// Close was called from outside Run.
+				return stop()
+			default:
+			}
+		}
+
+		delay, next := c.backoff(backoff)
+		backoff = next
+
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return stop()
+		case <-timer.C:
+		}
+	}
+}
+
+// waitConn parks until the connection behind errCh ends, ctx is cancelled, or
+// the client is closed, sending one keepalive ping per ping tick. It never
+// reads from the WebSocket: dialOnce owns the reader.
+func (c *Client) waitConn(ctx context.Context, errCh <-chan struct{}, ping <-chan time.Time) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-c.done:
+			return
+		case <-errCh:
+			return
+		case <-ping:
+			c.ping()
+		}
+	}
+}
+
+// backoffFloor is the first reconnect delay: BackoffMin, clamped to BackoffMax
+// so a misconfigured pair cannot delay a retry past the cap.
+func (c *Client) backoffFloor() time.Duration {
+	if c.cfg.BackoffMin > c.cfg.BackoffMax {
+		return c.cfg.BackoffMax
+	}
+	return c.cfg.BackoffMin
+}
+
+// backoff returns the jittered delay before the next dial and the step after
+// it. The delay is ±20% around current so a fleet of clients does not retry in
+// lockstep; next doubles current, capped at BackoffMax.
+func (c *Client) backoff(current time.Duration) (delay, next time.Duration) {
+	delay = current
+	if jitter := 0.2 * (2*rand.Float64() - 1); jitter != 0 {
+		delay = time.Duration(float64(current) * (1 + jitter))
+	}
+
+	next = c.cfg.BackoffMax
+	if current < c.cfg.BackoffMax/2 {
+		next = current * 2
+	}
+	return delay, next
+}
+
 // Send writes pkt as one binary frame, i.e. one UDP datagram. When no
 // connection is established the datagram is dropped and Send returns nil:
 // WireGuard generates traffic faster than a reconnect can complete, and
@@ -168,6 +333,26 @@ func (c *Client) Send(pkt []byte) error {
 		return fmt.Errorf("wstunnel: send: %w", err)
 	}
 	return nil
+}
+
+// ping sends one keepalive ping. It shares writeMu and writeFrame's deadline
+// with data frames, so a stalled peer cannot pin it, and gorilla's one-writer
+// rule holds. A failed ping retires the connection exactly like a failed
+// write, which wakes Run to reconnect.
+func (c *Client) ping() {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+
+	c.mu.Lock()
+	conn, gen := c.conn, c.gen
+	c.mu.Unlock()
+	if conn == nil {
+		return
+	}
+
+	if err := writeFrame(conn, websocket.PingMessage, nil, c.writeTimeout); err != nil {
+		c.failConn(conn, gen, err)
+	}
 }
 
 // Recv copies the next received datagram into buf and returns its length. If
@@ -232,8 +417,8 @@ func (c *Client) Close() error {
 }
 
 // State returns the connection state: "connecting" before the first
-// successful dial, "connected" while the WebSocket is live, and
-// "reconnecting" after a dial failure or a dropped connection.
+// successful dial, "connected" while the WebSocket is live, and "reconnecting"
+// after a dial failure, a dropped connection, or once Run has returned.
 func (c *Client) State() string {
 	c.stateMu.RLock()
 	defer c.stateMu.RUnlock()
@@ -376,6 +561,29 @@ func (c *Client) dialFailed() {
 		c.stateMu.Unlock()
 	}
 	c.mu.Unlock()
+}
+
+// isPermanentDialError reports whether a dial error is a certificate problem
+// that no amount of retrying can fix. Run returns such an error to the caller
+// verbatim instead of backing off forever.
+func isPermanentDialError(err error) bool {
+	var certErr *tls.CertificateVerificationError
+	if errors.As(err, &certErr) {
+		return true
+	}
+
+	// Older and lower-level paths surface the x509 error directly. The x509
+	// types implement error on the value receiver, hence value targets.
+	var unknownAuthority x509.UnknownAuthorityError
+	if errors.As(err, &unknownAuthority) {
+		return true
+	}
+	var hostname x509.HostnameError
+	if errors.As(err, &hostname) {
+		return true
+	}
+	var invalid x509.CertificateInvalidError
+	return errors.As(err, &invalid)
 }
 
 // endpoint builds the upgrade URL: the server's path is always

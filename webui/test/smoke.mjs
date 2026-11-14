@@ -24,18 +24,16 @@ const BUNDLE = resolve(
 const LANG = (isLang(argv[0]) ? argv[0] : argv[1]) ?? 'en';
 
 const STATUS = [
-    '2026-11-14T20:00:00+0800 INFO  wg-user: wireproxy: running (pid 123)',
+    '2026-11-14T20:00:00+0800 INFO  wg-user: wg-user: running (pid 123)',
     '2026-11-14T20:00:00+0800 INFO  wg-user: last log: DEBUG: keepalive',
-    'tunnel: running (pid 456)',
+    '2026-11-14T20:00:00+0800 INFO  wg-user: transport: 127.0.0.1:51820 (connected)',
     '',
 ].join('\n');
 
 const respond = (cmd) => {
     if (/wg-user status/.test(cmd)) return STATUS;
-    if (/wg-user tunnel status/.test(cmd)) return 'tunnel: running (pid 456)\n';
     if (/wg-user log/.test(cmd)) return 'DEBUG: handshake ok\nDEBUG: keepalive\n';
     if (/cat .*wireproxy\.conf/.test(cmd)) return 'BindAddress = 127.0.0.1:1080\n[WireGuard]\n';
-    if (/cat .*tunnel\.conf/.test(cmd)) return 'mode=wstunnel\n';
     return '';
 };
 
@@ -76,9 +74,11 @@ const html = document.getElementById('app').innerHTML;
 const checks = [
     ['green status dot', html.includes('bg-emerald-400')],
     ['status label', /Running|运行中/.test(html)],
-    ['status detail', html.includes('wireproxy: running (pid 123)')],
-    ['status detail includes tunnel', html.includes('tunnel: running (pid 456)')],
+    ['status detail', html.includes('wg-user: running (pid 123)')],
+    ['status detail includes transport', html.includes('transport: 127.0.0.1:51820 (connected)')],
+    ['transport state label', /Connected|已连接/.test(html)],
     ['status detail hides the log tail', !html.includes('last log:')],
+    ['no tunnel leftovers in rendered UI', !/tunnel/i.test(html)],
     ['log card has content', html.includes('DEBUG: handshake ok')],
     ['the 3-arg exec overload is used', calls.length > 0],
     ['commands use the absolute module path', calls.every((c) => c.startsWith('/data/adb/modules/wg-user/'))],

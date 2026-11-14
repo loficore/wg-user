@@ -110,9 +110,37 @@ const Header = () => (
     </header>
 );
 
+type TransportState = 'connected' | 'reconnecting' | 'off' | 'unknown';
+
+const TRANSPORT_STATES: readonly TransportState[] = ['connected', 'reconnecting', 'off', 'unknown'];
+
+// `status` prints `transport: <detail> (<state>)`; <detail> may be empty or contain brackets.
+const parseTransport = (lines: string[]): TransportState => {
+    const line = lines.find((l) => /^transport:\s*/.test(l));
+    const m = line?.match(/\((\w+)\)\s*$/);
+    const state = m?.[1];
+    return TRANSPORT_STATES.find((s) => s === state) ?? 'unknown';
+};
+
+const transportLabel = (state: TransportState | null): string => {
+    switch (state) {
+        case 'connected':
+            return t('transport.connected');
+        case 'reconnecting':
+            return t('transport.reconnecting');
+        case 'off':
+            return t('transport.off');
+        case 'unknown':
+            return t('transport.unknown');
+        default:
+            return t('status.checking');
+    }
+};
+
 const Status = ({ refreshKey }: { refreshKey: number }) => {
     const [state, setState] = useState<'ok' | 'err' | 'loading'>('loading');
     const [meta, setMeta] = useState('');
+    const [transport, setTransport] = useState<TransportState | null>(null);
 
     useEffect(() => {
         let cancelled = false;
@@ -120,18 +148,19 @@ const Status = ({ refreshKey }: { refreshKey: number }) => {
             try {
                 const out = await ksuExec(`${MOD}/wg-user status 2>&1 || true`);
                 if (cancelled) return;
-                const running = /wireproxy:\s*running/.test(out);
+                const running = /wg-user:\s*running/.test(out);
+                const lines = out
+                    .split('\n')
+                    .map((line) => line.replace(/^\S+\s+INFO\s+wg-user:\s*/, '').trim())
+                    .filter((line) => line !== '');
                 setState(running ? 'ok' : 'err');
-                setMeta(
-                    out
-                        .split('\n')
-                        .map((line) => line.replace(/^\S+\s+INFO\s+wg-user:\s*/, '').trim())
-                        .filter((line) => line !== '' && !/^last log:/.test(line))
-                        .join(' · '),
-                );
+                // Stopped means no transport line is printed; the transport is off.
+                setTransport(running ? parseTransport(lines) : 'off');
+                setMeta(lines.filter((line) => !/^last log:/.test(line)).join(' · '));
             } catch (e) {
                 if (cancelled) return;
                 setState('err');
+                setTransport('unknown');
                 setMeta(errorText(e));
             }
         };
@@ -155,6 +184,10 @@ const Status = ({ refreshKey }: { refreshKey: number }) => {
             <div class="flex items-center">
                 <Dot ok={state === 'ok'} err={state === 'err'} />
                 <span>{label}</span>
+            </div>
+            <div class="flex items-center text-xs mt-2">
+                <span class="text-slate-400 mr-2">{t('transport.label')}</span>
+                <span>{transportLabel(transport)}</span>
             </div>
             <div class="text-slate-400 text-xs mt-1">{meta}</div>
         </Card>
@@ -183,118 +216,6 @@ const Controls = ({ onChange }: { onChange: () => void }) => {
                     {t('controls.reload')}
                 </Button>
             </div>
-        </Card>
-    );
-};
-
-const Tunnel = ({ onChange }: { onChange: () => void }) => {
-    const [status, setStatus] = useState(t('status.checking'));
-    const [running, setRunning] = useState(false);
-    const [enabled, setEnabled] = useState(true);
-    const [editor, setEditor] = useState('');
-    const [editorStatus, setEditorStatus] = useState('');
-
-    const refresh = useCallback(async () => {
-        try {
-            const out = await ksuExec(`${MOD}/wg-user tunnel status 2>&1 || true`);
-            const text = out.trim();
-            const disabled = /tunnel:\s*disabled/.test(text);
-            const isRunning = /tunnel:\s*running/.test(text);
-            const last = text.split('\n').filter((l) => l.trim() !== '').pop();
-            setStatus(last ?? t('tunnel.unknown'));
-            setEnabled(!disabled);
-            setRunning(isRunning);
-        } catch (e) {
-            setStatus(errorText(e));
-            setEnabled(false);
-            setRunning(false);
-        }
-    }, []);
-
-    useEffect(() => {
-        void refresh();
-        const id = setInterval(() => void refresh(), 5000);
-        return () => clearInterval(id);
-    }, [refresh]);
-
-    const start = useDaemonCommand('tunnel start', () => {
-        void refresh();
-        onChange();
-    });
-    const stop = useDaemonCommand('tunnel stop', () => {
-        void refresh();
-        onChange();
-    });
-    const restart = useDaemonCommand('tunnel restart', () => {
-        void refresh();
-        onChange();
-    });
-    const anyBusy = start.busy || stop.busy || restart.busy;
-
-    const load = useCallback(async () => {
-        try {
-            setEditor(await ksuReadFile('etc/tunnel.conf'));
-            setEditorStatus(t('tunnel.loaded'));
-        } catch (e) {
-            setEditorStatus(t('tunnel.loadError', { msg: errorText(e) }));
-        }
-    }, []);
-
-    const save = useCallback(async () => {
-        const stage = `${MOD}/.save.tunnel.conf.tmp`;
-        const b64 = btoa(unescape(encodeURIComponent(editor)));
-        try {
-            await ksuExec(
-                `echo '${b64}' | base64 -d > ${stage} && ` +
-                    `cp ${stage} ${MOD}/etc/tunnel.conf && ` +
-                    `rm ${stage} && ${MOD}/wg-user reload 2>&1`,
-            );
-            setEditorStatus(t('tunnel.saved'));
-            void refresh();
-            onChange();
-        } catch (e) {
-            setEditorStatus(t('tunnel.saveError', { msg: errorText(e) }));
-        }
-    }, [editor, refresh, onChange]);
-
-    return (
-        <Card title={t('tunnel.title')} sub={t('tunnel.optional')}>
-            <div class="flex items-center">
-                <Dot ok={running} err={!running && enabled} />
-                <span class="text-sm">{status}</span>
-            </div>
-            <div class="flex flex-wrap gap-2 mt-2">
-                <Button id="btn-tunnel-start" disabled={anyBusy || !enabled || running} onClick={start.run}>
-                    {t('tunnel.start')}
-                </Button>
-                <Button id="btn-tunnel-stop" disabled={anyBusy || !running} onClick={stop.run}>
-                    {t('tunnel.stop')}
-                </Button>
-                <Button id="btn-tunnel-restart" disabled={anyBusy || !enabled} onClick={restart.run}>
-                    {t('tunnel.restart')}
-                </Button>
-            </div>
-            <details class="mt-3">
-                <summary class="cursor-pointer text-slate-400 text-sm select-none">
-                    {t('tunnel.config')}
-                </summary>
-                <textarea
-                    value={editor}
-                    onInput={(e) => setEditor(e.currentTarget.value)}
-                    spellcheck={false}
-                    rows={6}
-                    class="w-full mt-2 p-2 bg-black border border-slate-700 rounded text-xs font-mono text-slate-100 resize-y focus:outline-none focus:border-indigo-500"
-                />
-                <div class="flex flex-wrap gap-2 mt-2">
-                    <Button id="btn-load-tunnel" onClick={load}>
-                        {t('tunnel.load')}
-                    </Button>
-                    <Button id="btn-save-tunnel" primary onClick={save}>
-                        {t('tunnel.save')}
-                    </Button>
-                </div>
-                <div class="text-slate-400 text-xs mt-1">{editorStatus}</div>
-            </details>
         </Card>
     );
 };
@@ -400,7 +321,6 @@ export const App = () => {
             <Header />
             <Status refreshKey={tick} />
             <Controls onChange={() => setTick(tick + 1)} />
-            <Tunnel onChange={() => setTick(tick + 1)} />
             <Config onChange={() => setTick(tick + 1)} />
             <Log refreshKey={tick} />
         </div>

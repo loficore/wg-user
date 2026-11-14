@@ -4,18 +4,13 @@ go 1.26.0
 
 require (
 	github.com/go-ini/ini v1.67.0
+	github.com/gorilla/websocket v1.5.3
 	github.com/windtf/wireproxy v1.1.3
 )
 
 require (
 	github.com/MakeNowJust/heredoc/v2 v2.0.1 // indirect
 	github.com/google/btree v1.1.2 // indirect
-	// Pinned ahead of the transport task that will import it. wireproxy does
-	// NOT depend on gorilla/websocket, so this root-only require has no
-	// importer yet: keep it at v1.5.3 and do not run "go mod tidy" until the
-	// transport imports it (tidy would delete this line, and a later
-	// "go get github.com/gorilla/websocket" would resolve @latest instead).
-	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/things-go/go-socks5 v0.0.5 // indirect
 	golang.org/x/crypto v0.52.0 // indirect
 	golang.org/x/net v0.55.0 // indirect

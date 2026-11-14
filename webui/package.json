@@ -17,7 +17,7 @@
     "clean": "rm -f ../webroot/app.js ../webroot/index.html ../webroot/style.css"
   },
   "dependencies": {
-    "preact": "^10.29.8"
+    "preact": "^11.2.0"
   },
   "devDependencies": {
     "esbuild": "^0.28.2",

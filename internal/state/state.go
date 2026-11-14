@@ -14,9 +14,10 @@
 //
 // transport is a [Transport] mode from the configuration: "off" or "wstunnel".
 // transport_state mirrors the wstunnel client: one of "connected",
-// "connecting", "reconnecting" or "closed". transport_detail is free-form,
-// normally the wstunnel URL or the direct endpoint; it may contain ":" and "/"
-// but never a newline (Write rejects one). updated is Unix seconds.
+// "connecting", "reconnecting" or "closed". When transport is "off" there is
+// nothing to connect, so transport_state is "off" too. transport_detail is
+// free-form, normally the wstunnel URL or the direct endpoint; it may contain
+// ":" and "/" but never a newline (Write rejects one). updated is Unix seconds.
 //
 // The allowed values are documented here rather than imported from config and
 // wstunnel: this package depends only on the standard library. Read does not

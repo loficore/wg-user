@@ -6,8 +6,10 @@
 // regressions that only show up inside the manager's WebView (a broken
 // bridge overload, a truncated command, a mis-parsed status line).
 //
-// Two renders are covered: a running daemon with a connected transport and a
-// stopped daemon, which has no transport line at all and must show Off.
+// Several renders are covered: a running daemon with a connected transport,
+// off mode (`udp (off)`), a stopped daemon (no transport line at all), and one
+// running render per remaining transport state plus the paren-less
+// `transport: unknown` form.
 //
 // Usage: node test/smoke.mjs [path/to/app.js] [en|zh]
 
@@ -26,23 +28,54 @@ const BUNDLE = resolve(
 );
 const LANG = (isLang(argv[0]) ? argv[0] : argv[1]) ?? 'en';
 
+const PREFIX = '2026-11-14T20:00:00+0800 INFO  wg-user: ';
+const RUNNING = `${PREFIX}wg-user: running (pid 123)`;
+
 const STATUS_RUNNING = [
-    '2026-11-14T20:00:00+0800 INFO  wg-user: wg-user: running (pid 123)',
-    '2026-11-14T20:00:00+0800 INFO  wg-user: last log: DEBUG: keepalive',
-    '2026-11-14T20:00:00+0800 INFO  wg-user: transport: 127.0.0.1:51820 (connected)',
+    RUNNING,
+    `${PREFIX}last log: DEBUG: keepalive`,
+    `${PREFIX}transport: 127.0.0.1:51820 (connected)`,
     '',
 ].join('\n');
 
 // `wg-user status` prints this and exits 1; the bundle appends `|| true`, so
 // the bridge callback still reports success (code 0) with the output.
-const STATUS_STOPPED = ['2026-11-14T20:00:00+0800 INFO  wg-user: wg-user: stopped', ''].join('\n');
+const STATUS_STOPPED = [`${PREFIX}wg-user: stopped`, ''].join('\n');
 
-// off mode: the daemon runs but has no transport, so it reports `off` (Fix B).
-const STATUS_OFF_MODE = [
-    '2026-11-14T20:00:00+0800 INFO  wg-user: wg-user: running (pid 123)',
-    '2026-11-14T20:00:00+0800 INFO  wg-user: transport: udp (off)',
-    '',
-].join('\n');
+// off mode: the daemon runs but has no transport, so it reports `off`.
+const STATUS_OFF_MODE = [RUNNING, `${PREFIX}transport: udp (off)`, ''].join('\n');
+
+const statusFor = (transportLine) => [RUNNING, `${PREFIX}${transportLine}`, ''].join('\n');
+
+// One fixture per state the daemon can publish, with the label it must render.
+// `closed` is an Off transport; `unknown` is the paren-less form that `status`
+// prints when the state file is missing or belongs to another pid.
+const STATE_FIXTURES = [
+    {
+        name: 'closed',
+        status: statusFor('transport: wss://example.com:443 (closed)'),
+        label: /Off|未启用/,
+        detail: 'wss://example.com:443',
+    },
+    {
+        name: 'connecting',
+        status: statusFor('transport: wss://example.com:443 (connecting)'),
+        label: /Connecting|连接中/,
+        detail: 'wss://example.com:443',
+    },
+    {
+        name: 'reconnecting',
+        status: statusFor('transport: wss://example.com:443 (reconnecting)'),
+        label: /Reconnecting|重连中/,
+        detail: 'wss://example.com:443',
+    },
+    {
+        name: 'unknown',
+        status: statusFor('transport: unknown'),
+        label: /Unknown|未知/,
+        detail: '',
+    },
+];
 
 const respond = (cmd, status) => {
     if (/wg-user status/.test(cmd)) return status;
@@ -55,6 +88,10 @@ const code = readFileSync(BUNDLE, 'utf8');
 
 // Mount the bundle into a fresh document with a fake KSU bridge and return the
 // rendered HTML plus the commands the app issued.
+//
+// The bundle resolves `window` at call time, so an interval left running by an
+// earlier render would tick against this render's bridge. Track the ids the
+// bundle creates and clear them before returning.
 const render = async (status) => {
     const { window, document } = parseHTML(
         '<!doctype html><html><body><div id="app"></div></body></html>',
@@ -83,9 +120,20 @@ const render = async (status) => {
     globalThis.window = window;
     globalThis.document = document;
 
-    new Function(code)();
-
-    await new Promise((r) => setTimeout(r, 150));
+    const realSetInterval = globalThis.setInterval;
+    const timers = new Set();
+    globalThis.setInterval = (fn, ms, ...rest) => {
+        const id = realSetInterval(fn, ms, ...rest);
+        timers.add(id);
+        return id;
+    };
+    try {
+        new Function(code)();
+        await new Promise((r) => setTimeout(r, 150));
+    } finally {
+        globalThis.setInterval = realSetInterval;
+        for (const id of timers) globalThis.clearInterval(id);
+    }
     return { html: document.getElementById('app').innerHTML, calls };
 };
 
@@ -99,6 +147,12 @@ const transportRow = (html) => {
 const running = await render(STATUS_RUNNING);
 const offMode = await render(STATUS_OFF_MODE);
 const stopped = await render(STATUS_STOPPED);
+
+const states = [];
+for (const fixture of STATE_FIXTURES) {
+    const { html, calls } = await render(fixture.status);
+    states.push({ ...fixture, row: transportRow(html), calls: calls.length });
+}
 
 const checks = [
     ['green status dot', running.html.includes('bg-emerald-400')],
@@ -132,6 +186,15 @@ const checks = [
     ['off mode: status label', /Running|运行中/.test(offMode.html)],
     ['off mode: transport row shows off', /Off|未启用/.test(transportRow(offMode.html))],
     ['off mode: transport is not unknown', !/Unknown|未知/.test(transportRow(offMode.html))],
+
+    // One fixture per transport state: a wrong or missing mapping shows up as
+    // Unknown here (or as a raw state string).
+    ...states.flatMap(({ name, label, detail, row }) => {
+        const rows = [[`state ${name}: row label`, label.test(row)]];
+        if (detail) rows.push([`state ${name}: row keeps the detail`, row.includes(detail)]);
+        if (name !== 'unknown') rows.push([`state ${name}: row is not unknown`, !/Unknown|未知/.test(row)]);
+        return rows;
+    }),
 ];
 
 let failed = 0;
@@ -139,12 +202,15 @@ for (const [name, ok] of checks) {
     if (!ok) failed++;
     console.log(`${ok ? 'ok  ' : 'FAIL'} ${name}`);
 }
-const calls = running.calls.length + offMode.calls.length + stopped.calls.length;
-console.log(`--- ${calls} exec calls over 3 renders, lang=${LANG}`);
+const callCount =
+    running.calls.length + offMode.calls.length + stopped.calls.length +
+    states.reduce((n, s) => n + s.calls, 0);
+console.log(`--- ${callCount} exec calls over ${3 + states.length} renders, lang=${LANG}`);
 
 if (failed) {
     console.log(`\n--- running render ---\n${running.html.slice(0, 2000)}`);
     console.log(`\n--- off-mode render ---\n${offMode.html.slice(0, 2000)}`);
     console.log(`\n--- stopped render ---\n${stopped.html.slice(0, 2000)}`);
+    for (const { name, row } of states) console.log(`\n--- ${name} transport row ---\n${row}`);
 }
 process.exit(failed ? 1 : 0);

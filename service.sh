@@ -16,26 +16,25 @@ ROOT="$(CDPATH= cd -- "$(dirname -- "$SELF")" && pwd)"
 . "$ROOT/common/util.sh"
 . "$ROOT/common/abi.sh"
 
-# Sanity: ensure the binaries are in place. customize.sh / install.sh
-# should have run; if not (e.g. partial install), pick them now.
-if [ ! -x "$ROOT/bin/wireproxy" ]; then
-    log_warn "wireproxy missing; running ABI selection"
-    select_wireproxy_binary "$ROOT" "$ROOT/bin/wireproxy" || {
-        log_err "no wireproxy binary available; service.sh exiting"
+mkdir -p "$ROOT/run" "$ROOT/log"
+
+# Sanity: ensure the binary is in place. customize.sh / install.sh should have
+# run; if not (e.g. partial install), pick it now.
+if [ ! -x "$ROOT/bin/wg-user" ]; then
+    log_warn "bin/wg-user missing; running ABI selection"
+    select_binary "$ROOT" "$ROOT/bin/wg-user" || {
+        log_err "no wg-user binary available; service.sh exiting"
         exit 1
     }
 fi
-# wstunnel is optional — only needed if tunnel.conf enables it.
-if [ ! -x "$ROOT/bin/wstunnel" ]; then
-    log_warn "wstunnel not bundled; tunnel mode will be unavailable"
-fi
 
-# Start the daemon (this internally starts wstunnel first if enabled,
-# then wireproxy — see wg-user).
-"$ROOT/wg-user" start
+# Start the single daemon. A failure (bad config, port in use) is logged but not
+# fatal: the reload watcher below retries after the next config edit, which is
+# how a boot-time typo gets fixed without a reboot.
+"$ROOT/wg-user" start || log_warn "wg-user failed to start; waiting for a config change"
 
-# Start the reload watcher in the background. Watches BOTH wireproxy.conf
-# AND tunnel.conf; reload handles the right restart order.
+# Start the reload watcher in the background. etc/wireproxy.conf is the only
+# config the module has now; a transport change is an edit to that file.
 WATCHER="$ROOT/wg-user-reload"
 cat > "$WATCHER" <<'WATCHER_EOF'
 #!/system/bin/sh
@@ -43,43 +42,35 @@ set -eu
 ROOT="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 . "$ROOT/common/util.sh"
 
-WPCONF="$ROOT/etc/wireproxy.conf"
-TNCONF="$ROOT/etc/tunnel.conf"
-WPLOG="$ROOT/log/wireproxy.log"
-TNLOG="$ROOT/log/wstunnel.log"
+CONF="$ROOT/etc/wireproxy.conf"
+LOG="$ROOT/log/wg-user.log"
 INTERVAL="${WGU_RELOAD_INTERVAL:-5}"
 
-# Initialize mtimes.
-wp_mtime=0
-tn_mtime=0
-[ -f "$WPCONF" ] && wp_mtime=$(stat -c %Y "$WPCONF" 2>/dev/null || stat -f %m "$WPCONF" 2>/dev/null || echo 0)
-[ -f "$TNCONF" ] && tn_mtime=$(stat -c %Y "$TNCONF" 2>/dev/null || stat -f %m "$TNCONF" 2>/dev/null || echo 0)
+# mtime <file> — epoch seconds; GNU stat, then BSD stat, then 0.
+mtime() {
+    stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 0
+}
 
-log_info "reload-watcher started (interval ${INTERVAL}s); watching $WPCONF and $TNCONF"
+conf_mtime=0
+if [ -f "$CONF" ]; then conf_mtime=$(mtime "$CONF"); fi
+
+log_info "reload-watcher started (interval ${INTERVAL}s); watching $CONF"
 
 while :; do
     sleep "$INTERVAL" 2>/dev/null || sleep 5
 
-    cur_wp=0; cur_tn=0
-    [ -f "$WPCONF" ] && cur_wp=$(stat -c %Y "$WPCONF" 2>/dev/null || stat -f %m "$WPCONF" 2>/dev/null || echo 0)
-    [ -f "$TNCONF" ] && cur_tn=$(stat -c %Y "$TNCONF" 2>/dev/null || stat -f %m "$TNCONF" 2>/dev/null || echo 0)
+    cur=0
+    if [ -f "$CONF" ]; then cur=$(mtime "$CONF"); fi
 
-    wp_changed=0; tn_changed=0
-    [ "$cur_wp" != "$wp_mtime" ] && [ "$cur_wp" != "0" ] && wp_changed=1
-    [ "$cur_tn" != "$tn_mtime" ] && [ "$cur_tn" != "0" ] && tn_changed=1
+    [ "$cur" != "$conf_mtime" ] || continue
+    [ "$cur" != "0" ] || continue
 
-    if [ $wp_changed -eq 0 ] && [ $tn_changed -eq 0 ]; then
-        continue
-    fi
-
-    log_info "config change: wireproxy=$wp_changed tunnel=$tn_changed"
-    wp_mtime=$cur_wp
-    tn_mtime=$cur_tn
+    log_info "config change detected; reloading"
+    conf_mtime=$cur
     sleep 1  # debounce
 
-    # `wg-user reload` configtests wireproxy.conf, then restarts both
-    # in the right order (tunnel first if enabled, then wireproxy).
-    "$ROOT/wg-user" reload || log_warn "reload failed; see $WPLOG or $TNLOG"
+    # `wg-user reload` configtests wireproxy.conf, then restarts the daemon.
+    "$ROOT/wg-user" reload || log_warn "reload failed; see $LOG"
 done
 WATCHER_EOF
 chmod 0755 "$WATCHER"

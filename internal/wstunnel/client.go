@@ -35,6 +35,10 @@ const (
 	defaultBackoffMin = 500 * time.Millisecond
 	defaultBackoffMax = 30 * time.Second
 
+	// defaultWriteTimeout bounds every WebSocket write. Without it a peer
+	// that stops reading TCP would pin the writer forever.
+	defaultWriteTimeout = 10 * time.Second
+
 	// State values reported by State. Before the first successful dial the
 	// client is "connecting"; a failed dial or a dropped connection is
 	// "reconnecting"; a live WebSocket is "connected".
@@ -72,13 +76,37 @@ type Config struct {
 //
 // A Client is safe for concurrent use. Send may be called while the reader is
 // active; the reconnect supervisor may replace the connection underneath it.
+//
+// gorilla permits exactly one reader and one writer per connection. dialOnce
+// is the only code that starts a reader, and Clients serialise all writes
+// under writeMu; the supervisor must not start a reader of its own (see
+// dialOnce).
 type Client struct {
 	cfg Config
 
-	// mu guards conn and serialises every write. gorilla forbids concurrent
-	// writers, so data frames (and, later, pings) all take this lock.
+	// writeTimeout bounds every write so a peer that stops reading cannot pin
+	// the writer forever. Tests shorten it.
+	writeTimeout time.Duration
+
+	// writeMu serialises writes: gorilla allows one concurrent writer per
+	// connection, and every write must set a deadline via writeFrame. Lock
+	// order is writeMu → mu; nothing takes them the other way.
+	writeMu sync.Mutex
+
+	// mu guards the fields below. Critical sections are short and never do
+	// I/O, so teardown cannot get stuck behind a stalled write (a write holds
+	// only writeMu).
 	mu   sync.Mutex
 	conn *websocket.Conn
+	// gen identifies the published connection. A reader or writer captures
+	// it with conn and teardown only acts when both still match, so a stale
+	// reader can never poison a newer connection.
+	gen uint64
+	// readErr is the terminal error of the published connection; nil while
+	// it is healthy. readErrCh is closed when readErr is published or when
+	// the connection is retired by a redial, waking a parked Recv.
+	readErr   error
+	readErrCh chan struct{}
 
 	// inbox carries frame payloads from the reader goroutine to Recv.
 	inbox chan []byte
@@ -86,13 +114,6 @@ type Client struct {
 	// done is closed by Close and unblocks Recv.
 	done      chan struct{}
 	closeOnce sync.Once
-
-	// readErr / readErrCh report a reader failure to Recv. readErrCh is
-	// replaced by each successful dial so a reconnect can resume receiving;
-	// readErr is written before readErrCh is closed.
-	readErrMu sync.Mutex
-	readErr   error
-	readErrCh chan struct{}
 
 	stateMu sync.RWMutex
 	state   string
@@ -109,11 +130,12 @@ func New(cfg Config) *Client {
 	}
 
 	return &Client{
-		cfg:       cfg,
-		inbox:     make(chan []byte, inboxCapacity),
-		done:      make(chan struct{}),
-		readErrCh: make(chan struct{}),
-		state:     stateConnecting,
+		cfg:          cfg,
+		writeTimeout: defaultWriteTimeout,
+		inbox:        make(chan []byte, inboxCapacity),
+		done:         make(chan struct{}),
+		readErrCh:    make(chan struct{}),
+		state:        stateConnecting,
 	}
 }
 
@@ -121,14 +143,22 @@ func New(cfg Config) *Client {
 // connection is established the datagram is dropped and Send returns nil:
 // WireGuard generates traffic faster than a reconnect can complete, and
 // blocking there would wedge the tunnel.
+//
+// A write that fails or exceeds writeTimeout tears the connection down (so the
+// reader exits instead of waiting on a dead socket) and returns an error.
 func (c *Client) Send(pkt []byte) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
 
-	if c.conn == nil {
+	c.mu.Lock()
+	conn, gen := c.conn, c.gen
+	c.mu.Unlock()
+	if conn == nil {
 		return nil
 	}
-	if err := c.conn.WriteMessage(websocket.BinaryMessage, pkt); err != nil {
+
+	if err := writeFrame(conn, websocket.BinaryMessage, pkt, c.writeTimeout); err != nil {
+		c.failConn(conn, gen, err)
 		return fmt.Errorf("wstunnel: send: %w", err)
 	}
 	return nil
@@ -139,45 +169,48 @@ func (c *Client) Send(pkt []byte) error {
 // rather than truncating a datagram. After Close, Recv returns an error
 // wrapping net.ErrClosed.
 func (c *Client) Recv(buf []byte) (int, error) {
-	// Prefer the closed signal over whatever happens to be buffered: once
-	// Close returns, callers must observe net.ErrClosed deterministically.
-	select {
-	case <-c.done:
-		return 0, fmt.Errorf("wstunnel: receive: %w", net.ErrClosed)
-	default:
-	}
-
-	c.readErrMu.Lock()
-	errCh, readErr := c.readErrCh, c.readErr
-	c.readErrMu.Unlock()
-	if readErr != nil {
-		return 0, fmt.Errorf("wstunnel: receive: %w", readErr)
-	}
-
-	select {
-	case <-c.done:
-		return 0, fmt.Errorf("wstunnel: receive: %w", net.ErrClosed)
-	case <-errCh:
-		c.readErrMu.Lock()
-		readErr := c.readErr
-		c.readErrMu.Unlock()
-		return 0, fmt.Errorf("wstunnel: receive: %w", readErr)
-	case frame := <-c.inbox:
-		if len(frame) > len(buf) {
-			return 0, fmt.Errorf("wstunnel: frame of %d bytes exceeds buffer of %d", len(frame), len(buf))
+	for {
+		// Prefer the closed signal over whatever happens to be buffered: once
+		// Close returns, callers must observe net.ErrClosed deterministically.
+		select {
+		case <-c.done:
+			return 0, fmt.Errorf("wstunnel: receive: %w", net.ErrClosed)
+		default:
 		}
-		return copy(buf, frame), nil
+
+		c.mu.Lock()
+		errCh, readErr := c.readErrCh, c.readErr
+		c.mu.Unlock()
+		if readErr != nil {
+			return 0, fmt.Errorf("wstunnel: receive: %w", readErr)
+		}
+
+		select {
+		case <-c.done:
+			return 0, fmt.Errorf("wstunnel: receive: %w", net.ErrClosed)
+		case <-errCh:
+			// A redial may have retired this generation between the close and
+			// this wake-up, clearing readErr. Loop and re-snapshot rather than
+			// wrapping a nil error; a live generation is open again.
+			continue
+		case frame := <-c.inbox:
+			if len(frame) > len(buf) {
+				return 0, fmt.Errorf("wstunnel: frame of %d bytes exceeds buffer of %d", len(frame), len(buf))
+			}
+			return copy(buf, frame), nil
+		}
 	}
 }
 
 // Close tears down the connection. It is idempotent, and Recv afterwards
-// reports net.ErrClosed. A close while a dial is in flight is the
-// supervisor's concern; the dial either fails or its connection is closed by
-// the next Close.
+// reports net.ErrClosed. It never blocks on an in-flight write: the write
+// deadline and the socket close both release the writer.
 func (c *Client) Close() error {
 	c.closeOnce.Do(func() {
 		close(c.done)
 
+		// Snapshot under mu, then close outside it: a writer may be blocked
+		// inside WriteMessage, and this close is what unblocks it.
 		c.mu.Lock()
 		conn := c.conn
 		c.conn = nil
@@ -207,19 +240,36 @@ func (c *Client) setState(state string) {
 	c.stateMu.Unlock()
 }
 
-// dialOnce performs a single WebSocket handshake and starts the reader. It
-// does not retry; the supervisor owns backoff. Every error is prefixed with
-// "wstunnel:" so callers can print one line.
+// dialOnce performs a single WebSocket handshake, publishes the connection and
+// starts its one and only reader. It does not retry; the supervisor owns
+// backoff. Every error is prefixed with "wstunnel:".
+//
+// Reader ownership: dialOnce starts the readLoop goroutine for each connection
+// it publishes. The supervisor (Run) must only wait for the connection to end
+// and call dialOnce again; it must never start a read goroutine of its own.
+// gorilla supports exactly one concurrent reader per connection.
+//
+// If a previous connection is still published (an overlapping dial, or a
+// supervisor bug), it is closed so its socket and reader do not leak and two
+// readers never run against one conn. The reader's teardown is ignored
+// because its generation no longer matches.
 func (c *Client) dialOnce(ctx context.Context) error {
+	// Never dial during or after shutdown.
+	select {
+	case <-c.done:
+		return fmt.Errorf("wstunnel: dial: %w", net.ErrClosed)
+	default:
+	}
+
 	endpoint, err := c.endpoint()
 	if err != nil {
-		c.setState(stateReconnecting)
+		c.dialFailed()
 		return err
 	}
 
 	token, err := BuildToken(c.cfg.Target)
 	if err != nil {
-		c.setState(stateReconnecting)
+		c.dialFailed()
 		return err
 	}
 
@@ -240,7 +290,7 @@ func (c *Client) dialOnce(ctx context.Context) error {
 
 	conn, _, err := dialer.DialContext(ctx, endpoint, header)
 	if err != nil {
-		c.setState(stateReconnecting)
+		c.dialFailed()
 		return fmt.Errorf("wstunnel: dial %s: %w", endpoint, err)
 	}
 
@@ -255,21 +305,54 @@ func (c *Client) dialOnce(ctx context.Context) error {
 	default:
 	}
 
-	// A fresh connection may follow a failed one, so clear the previous
-	// reader error before exposing the connection.
-	c.readErrMu.Lock()
+	// Publish the new generation atomically: conn, generation, a fresh error
+	// channel and the connected state all become visible together.
+	c.mu.Lock()
+	prev, prevErrCh := c.conn, c.readErrCh
+	c.conn = conn
+	c.gen++
+	gen := c.gen
 	c.readErr = nil
 	c.readErrCh = make(chan struct{})
-	c.readErrMu.Unlock()
-
-	c.mu.Lock()
-	c.conn = conn
+	c.stateMu.Lock()
+	c.state = stateConnected
+	c.stateMu.Unlock()
 	c.mu.Unlock()
 
-	c.setState(stateConnected)
-	go c.readLoop(conn)
+	// Retire the previous connection outside mu: close its socket (its reader
+	// then exits) and its error channel (a parked Recv re-snapshots the new
+	// generation). The old reader's failConn finds a generation mismatch and
+	// does not touch the new connection's state.
+	if prev != nil {
+		_ = prev.Close()
+		close(prevErrCh)
+	}
+
+	go c.readLoop(conn, gen)
 
 	return nil
+}
+
+// dialFailed reports a dial failure as "reconnecting", but only when no
+// connection is published (a concurrent dial may have succeeded) and the
+// client is not shutting down.
+func (c *Client) dialFailed() {
+	select {
+	case <-c.done:
+		return
+	default:
+	}
+
+	// The idle check and the state change are atomic with respect to a
+	// concurrent successful dial, which publishes conn and "connected" under
+	// the same lock.
+	c.mu.Lock()
+	if c.conn == nil {
+		c.stateMu.Lock()
+		c.state = stateReconnecting
+		c.stateMu.Unlock()
+	}
+	c.mu.Unlock()
 }
 
 // endpoint builds the upgrade URL: the server's path is always
@@ -291,14 +374,24 @@ func (c *Client) endpoint() (string, error) {
 	return u.String(), nil
 }
 
+// writeFrame writes one WebSocket message under the caller's writeMu, always
+// with a deadline so a peer that stops reading cannot block the writer
+// forever. Every write path (data frames here, pings later) must go through
+// it.
+func writeFrame(conn *websocket.Conn, messageType int, pkt []byte, timeout time.Duration) error {
+	if err := conn.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
+		return err
+	}
+	return conn.WriteMessage(messageType, pkt)
+}
+
 // readLoop moves frames from conn into inbox until conn fails. It is the only
-// reader of conn: gorilla allows one concurrent reader and one concurrent
-// writer, and Send holds the writer side.
-func (c *Client) readLoop(conn *websocket.Conn) {
+// reader of conn; dialOnce starts exactly one per published connection.
+func (c *Client) readLoop(conn *websocket.Conn, gen uint64) {
 	for {
 		mt, data, err := conn.ReadMessage()
 		if err != nil {
-			c.readFailed(conn, err)
+			c.failConn(conn, gen, err)
 			return
 		}
 		if mt != websocket.BinaryMessage {
@@ -323,37 +416,44 @@ func (c *Client) readLoop(conn *websocket.Conn) {
 	}
 }
 
-// readFailed records a terminal reader error, detaches the connection and
-// wakes Recv.
-func (c *Client) readFailed(conn *websocket.Conn, err error) {
+// failConn tears down conn and publishes cause to Recv, but only when
+// (conn, gen) is still the published connection. A stale reader or writer
+// therefore returns false without touching readErr, readErrCh or state, so it
+// cannot poison a newer connection. It reports whether this call owned the
+// teardown.
+func (c *Client) failConn(conn *websocket.Conn, gen uint64, cause error) bool {
 	c.mu.Lock()
-	if c.conn == conn {
-		c.conn = nil
+	if c.conn != conn || c.gen != gen {
+		c.mu.Unlock()
+		return false
 	}
-	c.mu.Unlock()
 
-	// The read error already leaves the connection unusable; closing it
-	// releases the socket and tells the peer.
-	_ = conn.Close()
-
+	// Detaching under mu is the atomic decision: only this goroutine may now
+	// close the generation's error channel. Publish the state here too, so a
+	// redial cannot publish "connected" in between and then be overwritten.
+	c.conn = nil
+	errCh := c.readErrCh
+	if c.readErr == nil {
+		c.readErr = cause
+	}
+	c.stateMu.Lock()
 	select {
 	case <-c.done:
-		// Close already happened; Recv reports net.ErrClosed, not this error.
-		return
+		// Shutdown owns the terminal state; Recv reports net.ErrClosed.
 	default:
+		c.state = stateReconnecting
 	}
+	c.stateMu.Unlock()
+	c.mu.Unlock()
 
-	c.readErrMu.Lock()
-	if c.readErr == nil {
-		c.readErr = err
-	}
-	c.readErrMu.Unlock()
+	// Close outside mu: a concurrent Send may be blocked in WriteMessage, and
+	// this close is what releases it.
+	_ = conn.Close()
 
-	select {
-	case <-c.readErrCh:
-	default:
-		close(c.readErrCh)
-	}
+	// The failure won the detach, so this channel is still open: a redial
+	// that retired the generation would have cleared c.conn first, in which
+	// case the check above returned false.
+	close(errCh)
 
-	c.setState(stateReconnecting)
+	return true
 }

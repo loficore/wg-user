@@ -28,6 +28,7 @@ type fakeServer struct {
 	auths     []string
 	paths     []string
 	conns     int
+	closed    int
 	frames    [][]byte
 }
 
@@ -54,6 +55,11 @@ func newFakeServer(t *testing.T, handle func(*websocket.Conn)) *fakeServer {
 		fs.mu.Lock()
 		fs.conns++
 		fs.mu.Unlock()
+		defer func() {
+			fs.mu.Lock()
+			fs.closed++
+			fs.mu.Unlock()
+		}()
 
 		if handle != nil {
 			handle(conn)
@@ -127,6 +133,12 @@ func (fs *fakeServer) connections() int {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 	return fs.conns
+}
+
+func (fs *fakeServer) closedConnections() int {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	return fs.closed
 }
 
 func (fs *fakeServer) received() [][]byte {
@@ -391,5 +403,203 @@ func TestRecv_RejectsFrameLargerThanBuffer(t *testing.T) {
 	const want = "wstunnel: frame of 1300 bytes exceeds buffer of 100"
 	if err.Error() != want {
 		t.Errorf("error = %q, want %q", err, want)
+	}
+}
+
+// newStalledServer starts a fake server that upgrades but never reads, so the
+// client's TCP send buffer eventually fills and writes block until their
+// deadline.
+func newStalledServer(t *testing.T) *fakeServer {
+	t.Helper()
+	stop := make(chan struct{})
+	fs := newFakeServer(t, func(conn *websocket.Conn) {
+		<-stop
+	})
+	// Registered after the server's own cleanup, so it runs first (LIFO) and
+	// lets the blocked handler return before httptest.Server.Close.
+	t.Cleanup(func() { close(stop) })
+	return fs
+}
+
+func TestSend_BoundsWriteWhenPeerStalls(t *testing.T) {
+	fs := newStalledServer(t)
+	c := dialTestClient(t, fs, Config{})
+	c.writeTimeout = 100 * time.Millisecond
+
+	pkt := make([]byte, 1<<20)
+	var err error
+	start := time.Now()
+	for i := 0; i < 200; i++ {
+		if err = c.Send(pkt); err != nil {
+			break
+		}
+	}
+	if err == nil {
+		t.Fatal("Send never failed against a peer that never reads")
+	}
+	if !strings.HasPrefix(err.Error(), "wstunnel:") {
+		t.Errorf("error %q is not prefixed with %q", err, "wstunnel:")
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("Send took %v to give up on a stalled peer, want the write deadline to bound it", elapsed)
+	}
+
+	waitFor(t, "the stalled connection to be torn down", func() bool {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		return c.conn == nil
+	})
+	if err := c.Send([]byte("dropped")); err != nil {
+		t.Errorf("Send after teardown = %v, want nil", err)
+	}
+}
+
+func TestClose_UnblocksStalledWrite(t *testing.T) {
+	fs := newStalledServer(t)
+	c := dialTestClient(t, fs, Config{})
+	// Long enough that only Close can release the writer.
+	c.writeTimeout = 30 * time.Second
+
+	sendDone := make(chan struct{})
+	go func() {
+		defer close(sendDone)
+		pkt := make([]byte, 1<<20)
+		for i := 0; i < 500; i++ {
+			if err := c.Send(pkt); err != nil {
+				return
+			}
+		}
+	}()
+
+	// Let the writer fill the socket and block inside WriteMessage.
+	time.Sleep(100 * time.Millisecond)
+
+	start := time.Now()
+	if err := c.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("Close blocked for %v behind a stalled write", elapsed)
+	}
+
+	select {
+	case <-sendDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Send stayed blocked after Close")
+	}
+}
+
+func TestReadLoop_StaleFailureIgnoredAfterRedial(t *testing.T) {
+	fs := newFakeServer(t, nil)
+	c := dialTestClient(t, fs, Config{})
+
+	c.mu.Lock()
+	oldConn, oldGen := c.conn, c.gen
+	c.mu.Unlock()
+
+	if err := c.dialOnce(context.Background()); err != nil {
+		t.Fatalf("second dialOnce: %v", err)
+	}
+	if n := fs.connections(); n != 2 {
+		t.Fatalf("server saw %d connections, want 2", n)
+	}
+
+	// Simulate the previous connection's reader failing only now. It must be
+	// ignored: the newer connection owns the error channel and the state.
+	if c.failConn(oldConn, oldGen, errors.New("stale reader")) {
+		t.Fatal("failConn accepted a retired generation")
+	}
+	if got := c.State(); got != "connected" {
+		t.Errorf("State = %q after a stale failure, want %q", got, "connected")
+	}
+
+	if err := c.Send([]byte("live")); err != nil {
+		t.Fatalf("Send on the new connection: %v", err)
+	}
+	buf := make([]byte, 16)
+	n, err := c.Recv(buf)
+	if err != nil {
+		t.Fatalf("Recv on the new connection was poisoned by the stale reader: %v", err)
+	}
+	if n != len("live") || string(buf[:n]) != "live" {
+		t.Errorf("Recv = %q, want %q", buf[:n], "live")
+	}
+}
+
+func TestDialOnce_ClosesPreviousConnection(t *testing.T) {
+	fs := newFakeServer(t, nil)
+	c := dialTestClient(t, fs, Config{})
+
+	c.mu.Lock()
+	oldConn := c.conn
+	c.mu.Unlock()
+
+	if err := c.dialOnce(context.Background()); err != nil {
+		t.Fatalf("second dialOnce: %v", err)
+	}
+
+	waitFor(t, "the previous connection's handler to finish", func() bool {
+		return fs.closedConnections() >= 1
+	})
+
+	if err := oldConn.WriteMessage(websocket.BinaryMessage, []byte("old")); err == nil {
+		t.Error("previous connection is still writable after the redial")
+	}
+}
+
+func TestRecv_SurvivesRedialWithoutNilError(t *testing.T) {
+	fs := newFakeServer(t, nil)
+	c := dialTestClient(t, fs, Config{})
+
+	type result struct {
+		n   int
+		err error
+	}
+	res := make(chan result, 1)
+	go func() {
+		n, err := c.Recv(make([]byte, 16))
+		res <- result{n: n, err: err}
+	}()
+
+	// Give Recv time to park on the first generation's error channel.
+	time.Sleep(20 * time.Millisecond)
+
+	// Retiring the generation closes that channel with readErr still nil; Recv
+	// must re-snapshot instead of wrapping a nil error.
+	if err := c.dialOnce(context.Background()); err != nil {
+		t.Fatalf("second dialOnce: %v", err)
+	}
+
+	if err := c.Send([]byte("after")); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	select {
+	case r := <-res:
+		if r.err != nil {
+			t.Fatalf("Recv returned %v after a redial, want the echoed frame", r.err)
+		}
+		if r.n != len("after") {
+			t.Errorf("Recv returned %d bytes, want %d", r.n, len("after"))
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Recv stayed parked after a redial")
+	}
+}
+
+func TestDialOnce_AfterCloseReturnsErrClosed(t *testing.T) {
+	fs := newFakeServer(t, nil)
+
+	c := New(Config{URL: fs.url(false), Target: "10.0.0.2:51820"})
+	if err := c.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	err := c.dialOnce(context.Background())
+	if !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("dialOnce after Close = %v, want net.ErrClosed", err)
+	}
+	if n := fs.connections(); n != 0 {
+		t.Errorf("server saw %d connections, want 0 (dialOnce must not dial after Close)", n)
 	}
 }

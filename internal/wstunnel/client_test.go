@@ -603,3 +603,35 @@ func TestDialOnce_AfterCloseReturnsErrClosed(t *testing.T) {
 		t.Errorf("server saw %d connections, want 0 (dialOnce must not dial after Close)", n)
 	}
 }
+
+func TestDialOnce_CloseDuringPublishDoesNotLeak(t *testing.T) {
+	fs := newFakeServer(t, nil)
+	c := New(Config{URL: fs.url(false), Target: "10.0.0.2:51820"})
+
+	// Close lands after the handshake, in the window between the done check
+	// and the publish critical section. The fresh connection must not be
+	// published; it must be closed and dialOnce must report ErrClosed.
+	c.beforePublish = func() { _ = c.Close() }
+
+	err := c.dialOnce(context.Background())
+	if !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("dialOnce = %v, want net.ErrClosed", err)
+	}
+	if got := c.State(); got == "connected" {
+		t.Errorf("State = %q after a Close during publish, want not connected", got)
+	}
+	if n := fs.connections(); n != 1 {
+		t.Fatalf("server saw %d connections, want 1 (the handshake did happen)", n)
+	}
+
+	waitFor(t, "the unpublished connection to be closed", func() bool {
+		return fs.closedConnections() >= 1
+	})
+
+	c.mu.Lock()
+	conn := c.conn
+	c.mu.Unlock()
+	if conn != nil {
+		t.Error("dialOnce published a connection after Close")
+	}
+}

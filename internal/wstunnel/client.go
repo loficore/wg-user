@@ -88,6 +88,12 @@ type Client struct {
 	// the writer forever. Tests shorten it.
 	writeTimeout time.Duration
 
+	// beforePublish is a test-only seam invoked by dialOnce between the
+	// post-handshake shutdown check and the publish critical section. It lets
+	// tests exercise a Close landing exactly in that window. Production leaves
+	// it nil.
+	beforePublish func()
+
 	// writeMu serialises writes: gorilla allows one concurrent writer per
 	// connection, and every write must set a deadline via writeFrame. Lock
 	// order is writeMu → mu; nothing takes them the other way.
@@ -307,7 +313,24 @@ func (c *Client) dialOnce(ctx context.Context) error {
 
 	// Publish the new generation atomically: conn, generation, a fresh error
 	// channel and the connected state all become visible together.
+	//
+	// A Close that raced the handshake passed the check above only because
+	// nothing was published yet; recheck under mu, which Close takes after
+	// closing done. Publishing here without the recheck would leak a live
+	// socket and reader that Close never sees.
+	if c.beforePublish != nil {
+		c.beforePublish()
+	}
+
 	c.mu.Lock()
+	select {
+	case <-c.done:
+		c.mu.Unlock()
+		_ = conn.Close()
+		return fmt.Errorf("wstunnel: dial %s: %w", endpoint, net.ErrClosed)
+	default:
+	}
+
 	prev, prevErrCh := c.conn, c.readErrCh
 	c.conn = conn
 	c.gen++

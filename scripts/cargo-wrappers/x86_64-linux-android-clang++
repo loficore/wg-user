@@ -1,5 +1,5 @@
 #!/bin/sh
 # NDK clang++ wrapper for x86_64-linux-android
 # Override by setting NDK env var before running cargo.
-NDK="${NDK:-/home/lofibass/Android/Sdk/ndk/26.3.11579264}"
+NDK="${NDK:-${ANDROID_NDK_HOME:-$HOME/Android/Sdk/ndk/26.3.11579264}}"
 exec "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/x86_64-linux-android26-clang++" "$@"

@@ -1,0 +1,132 @@
+name: Release
+
+# Tag push -> full build (Go + Rust cross-compiles + WebUI) -> GitHub Release
+# with wg-user-<version>.zip and SHA256SUMS attached.
+#
+# workflow_dispatch runs the same build and uploads the zip as a workflow
+# artifact, but does not create a release.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  # build.sh defaults to the China mirror; on GitHub use the canonical proxy.
+  GOPROXY: https://proxy.golang.org,direct
+
+jobs:
+  build:
+    name: Build + package
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Tag matches module.prop
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          v=$(sed -n 's/^version=//p' module.prop)
+          if [ "v$v" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match module.prop version v$v"
+            exit 1
+          fi
+
+      # ---------------- wireproxy (Go) ----------------
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ runner.os }}-${{ hashFiles('scripts/build.sh') }}
+          restore-keys: go-${{ runner.os }}-
+
+      - name: Build wireproxy for 4 arches
+        run: bash scripts/build.sh
+
+      # ---------------- wstunnel (Rust) ----------------
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+
+      - uses: nttld/setup-ndk@v1
+        id: ndk
+        with:
+          ndk-version: r26d
+          add-to-path: false
+
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ runner.os }}-${{ hashFiles('scripts/cargo-cross.sh') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: Build wstunnel for 4 arches
+        env:
+          NDK: ${{ steps.ndk.outputs.ndk-path }}
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: bash scripts/cargo-cross.sh
+
+      - name: Every arch produced both binaries
+        run: |
+          for a in arm64-v8a armeabi-v7a x86_64 x86; do
+            for b in wireproxy wstunnel; do
+              test -x "bin/$a/$b" || { echo "::error::missing bin/$a/$b"; exit 1; }
+            done
+          done
+          ls -lh bin/*/
+
+      # ---------------- WebUI + package ----------------
+      - uses: pnpm/action-setup@v6
+        with:
+          package_json_file: webui/package.json
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 26
+          cache: pnpm
+          cache-dependency-path: webui/pnpm-lock.yaml
+
+      - name: Build WebUI and zip the module
+        run: make package-only
+
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum wg-user-*.zip > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Show zip contents
+        run: |
+          zipinfo -1 dist/wg-user-*.zip | sed -n '1,40p'
+          echo "total entries: $(zipinfo -1 dist/wg-user-*.zip | wc -l)"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wg-user-module
+          path: |
+            dist/wg-user-*.zip
+            dist/SHA256SUMS
+          retention-days: 30
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "wg-user ${GITHUB_REF_NAME}" \
+            --generate-notes \
+            dist/wg-user-*.zip dist/SHA256SUMS

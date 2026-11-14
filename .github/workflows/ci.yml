@@ -1,0 +1,117 @@
+name: CI
+
+# Runs on every pull request and on pushes to main. Keep this fast: the
+# heavy Rust cross-compile only runs in the release workflow.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  scripts:
+    name: Shell + packaging checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: sh -n on every script, NDK wrappers executable
+        run: make verify
+
+      - name: No real configs are tracked
+        run: |
+          if git ls-files --error-unmatch etc/wireproxy.conf etc/tunnel.conf 2>/dev/null; then
+            echo "::error::etc/wireproxy.conf and etc/tunnel.conf must never be tracked (they hold keys)"
+            exit 1
+          fi
+          echo "ok: only *.example configs are tracked"
+
+      - name: Module metadata is coherent
+        run: |
+          grep -q '^id=wg-user$' module.prop
+          grep -qE '^versionCode=[0-9]+$' module.prop
+          v=$(sed -n 's/^version=//p' module.prop)
+          w=$(node -p "require('./webui/package.json').version")
+          echo "module.prop=$v webui/package.json=$w"
+
+  webui:
+    name: WebUI (tsc + build + smoke test)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: webui
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: pnpm/action-setup@v6
+        with:
+          package_json_file: webui/package.json
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 26
+          cache: pnpm
+          cache-dependency-path: webui/pnpm-lock.yaml
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck, build, smoke test
+        run: pnpm run check
+
+      - name: The committed bundle matches the sources
+        working-directory: .
+        run: |
+          if ! git diff --exit-code -- webroot/; then
+            echo "::error::webroot/ is stale — run 'make webui' and commit the result"
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: webroot
+          path: webroot/
+          retention-days: 7
+
+  build-go:
+    name: wireproxy (4 arches)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ runner.os }}-${{ hashFiles('scripts/build.sh') }}
+          restore-keys: go-${{ runner.os }}-
+
+      - name: Cross-compile wireproxy
+        env:
+          GOPROXY: https://proxy.golang.org,direct
+        run: bash scripts/build.sh
+
+      - name: Every arch produced a binary
+        run: |
+          for a in arm64-v8a armeabi-v7a x86_64 x86; do
+            test -x "bin/$a/wireproxy" || { echo "::error::missing bin/$a/wireproxy"; exit 1; }
+          done
+          ls -lh bin/*/wireproxy
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wireproxy-bin
+          path: bin/*/wireproxy
+          retention-days: 7

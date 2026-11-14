@@ -1,5 +1,8 @@
 # wg-user
 
+[![CI](https://github.com/loficore/wg-user/actions/workflows/ci.yml/badge.svg)](https://github.com/loficore/wg-user/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/loficore/wg-user)](https://github.com/loficore/wg-user/releases/latest)
+
 > Userspace WireGuard client exposed as a SOCKS5/HTTP proxy.
 > A KernelSU / Magisk / APatch module.
 
@@ -71,6 +74,37 @@ Requires:
 
 The Go build uses `GOPROXY=https://goproxy.cn,direct` by default — override
 with `GOPROXY=... make build` if you need a different proxy.
+
+## CI and releases
+
+Pull requests run `.github/workflows/ci.yml`:
+
+| Job | What it checks |
+|---|---|
+| `scripts` | `sh -n` on every script, NDK wrappers executable, no real `etc/*.conf` tracked |
+| `webui` | `pnpm install --frozen-lockfile` → `tsc --noEmit` → esbuild → headless smoke test, then fails if `webroot/` is stale |
+| `build-go` | cross-compiles wireproxy for all four arches |
+
+The Rust cross-compile is too slow for PRs, so it only runs on release.
+
+Pushing a `v*` tag runs `.github/workflows/release.yml`, which builds
+wireproxy and wstunnel for all four arches, builds the WebUI, zips the
+module and publishes `wg-user-<version>.zip` plus `SHA256SUMS` to a
+GitHub Release. The tag must equal `v$(version)` from `module.prop`.
+
+Cut a release:
+
+```bash
+# 1. bump module.prop (version + versionCode) and webui/package.json
+# 2. rebuild the committed bundle
+make webui
+# 3. commit, then tag and push
+jj tag set "v$(sed -n 's/^version=//p' module.prop)"
+jj git push --tag v0.2.0 --bookmark main
+```
+
+`workflow_dispatch` on the release workflow runs the same build without
+creating a release — useful for verifying the toolchain.
 
 ## License
 

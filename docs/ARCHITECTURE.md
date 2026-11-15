@@ -163,6 +163,19 @@ back to.
 `bin/wg-user run -c etc/wireproxy.conf` (started by `wg-user start`) is the
 only long-lived process. Its shape:
 
+The first thing `run` does is not about the tunnel: `device.EscapeAppCgroup`
+moves the process out of an Android per-app cgroup (`/uid_<uid>/pid_<pid>`)
+into the root cgroup. Android freezes those cgroups when the owning app is
+backgrounded, and every process started from an app inherits one — the WebUI
+runs inside the KernelSU app, so "restart" from there handed the daemon a
+cgroup the framework could freeze. A frozen daemon stays alive, keeps its pid
+file and its last `run/state`, and does nothing: the transport appears stuck
+in `connecting` and no restart helps. The root cgroup is where a boot-started
+daemon already lives (`service.sh` is executed by the root framework), so this
+removes the app's freezer without changing privilege; a process already
+outside an app cgroup is left alone, and on a system with no cgroup v2
+hierarchy the call is a no-op.
+
 1. **Signals.** `SIGINT`/`SIGTERM` cancel the root context.
 2. **Config.** `config.Load` parses `etc/wireproxy.conf` and validates
    `[Transport]` before anything is brought up. A bad file exits 2.

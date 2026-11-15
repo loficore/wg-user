@@ -345,6 +345,27 @@ So do not wait for a message that will never be printed: use the checks below.
   identical from the phone: `transport: wss://… (connected)` in
   `wg-user status`, no WireGuard handshake, nothing in the client log beyond
   the upgrade.
+- **The daemon is alive but nothing happens: `connecting` forever, restarts
+  change nothing.** The process may be frozen by Android rather than broken.
+  Every process started from an app inherits that app's cgroup
+  (`/uid_<uid>/pid_<pid>`), and the framework freezes it when the app is
+  backgrounded — the WebUI runs inside the KernelSU app, so a restart from
+  there used to hand the daemon a freezable cgroup. The daemon then stays
+  alive with a valid pid file and a stale `run/state`, its SOCKS listener
+  keeps a backlog and the transport never leaves `connecting`. Check:
+
+  ```bash
+  pid=$(cat /data/adb/modules/wg-user/run/wg-user.pid)
+  awk -F: '$1 == "0" { print $3 }' "/proc/$pid/cgroup"
+  ```
+
+  `/uid_…/pid_…` means frozen; `/` is the root cgroup and healthy. 0.3.2 and
+  later move themselves to `/` at startup, and `wg-user status` warns when it
+  sees an app cgroup, so this only affects older installs or a hand-started
+  binary. On such a process, `wg-user restart` is not enough if it is started
+  from the same app: move the running pid once with
+  `echo "$pid" > /sys/fs/cgroup/cgroup.procs` (root), or start the daemon
+  from `service.sh` / a root shell outside the app.
 - **`connection refused` / timeout on the phone.** The server is not
   running or TCP 443 is blocked. From another host:
   `curl -vI https://your-server.example.com` should return a TLS banner.

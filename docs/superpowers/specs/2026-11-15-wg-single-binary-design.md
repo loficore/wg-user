@@ -216,12 +216,16 @@ wg-user version
 ```
 pid=1234
 transport=wstunnel
-transport_state=connected      # connected | connecting | reconnecting
+transport_state=connected      # connected | connecting | reconnecting | closed
 transport_detail=wss://frp-pen.com:57968
 updated=1763000000
 ```
 
-`Mode = off` 时 `transport=off`、`transport_state=connected`（UDP 无连接状态）。
+`Mode = off` 时 `transport=off`、`transport_state=off`、`transport_detail=udp`（没有传输层，也不存在连接状态）。
+
+注：`transport_state` 在 wstunnel 模式下的取值与 `internal/wstunnel` 的 `Client.State()` 一致，即
+`connected | connecting | reconnecting | closed`；`off` 只出现在 `Mode = off` 时。WebUI 把 `closed` 与 `off`
+都展示为“未启用”，`connecting` 展示为“连接中”。
 
 ### 8.3 shell CLI（`wg-user`）
 

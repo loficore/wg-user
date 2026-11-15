@@ -22,7 +22,9 @@ PKG_FILES := module.prop customize.sh uninstall.sh sepolicy.rule service.sh wg-u
 # Entries the archive must contain. PKG_FILES is hand-maintained and `zip -r`
 # exits 0 when a named entry is missing (it just leaves it out), so an omission
 # would ship silently; check-archive asserts the result. Paths are relative to
-# the archive root, exactly as zipinfo -1 prints them.
+# the archive root, exactly as zipinfo -1 prints them. The list is deliberately
+# runtime-only: docs/, LICENSE and sepolicy.rule are packaged but not asserted
+# (a missing doc degrades the package, a missing script/binary breaks it).
 PKG_REQUIRED := module.prop wg-user service.sh customize.sh uninstall.sh \
 	common/util.sh common/abi.sh webroot/app.js webroot/index.html \
 	etc/wireproxy.conf.example \
@@ -89,8 +91,11 @@ check-bins:
 	fi
 
 # Assert the archive just written has every required entry. Runs after the zip
-# step (zip exits 0 for a missing PKG_FILES entry). The tar fallback only happens
-# when zip is absent, i.e. when zipinfo is absent too; it is reported, not checked.
+# step (zip exits 0 for a missing PKG_FILES entry). If only the tar fallback
+# exists (no `zip`, hence no archive tool at all) the check is reported, not
+# attempted. zipinfo is not implied by `zip`: Debian/Ubuntu package it in
+# `unzip`, so fall back to `unzip -Z1` and fail with an install hint rather than
+# a bare "command not found".
 check-archive:
 	@set -e; \
 	zip="$(DIST)/wg-user-$(VERSION).zip"; \
@@ -103,7 +108,15 @@ check-archive:
 	    echo "ERROR: no archive in $(DIST)"; \
 	    exit 1; \
 	fi; \
-	listing=$$(zipinfo -1 "$$zip"); \
+	if command -v zipinfo >/dev/null 2>&1; then \
+	    listing=$$(zipinfo -1 "$$zip"); \
+	elif command -v unzip >/dev/null 2>&1; then \
+	    listing=$$(unzip -Z1 "$$zip"); \
+	else \
+	    echo "ERROR: cannot inspect $$zip: neither zipinfo nor unzip is installed."; \
+	    echo "       Install unzip (it provides zipinfo) or package on a host that has it."; \
+	    exit 1; \
+	fi; \
 	missing=""; \
 	for e in $(PKG_REQUIRED); do \
 	    printf '%s\n' "$$listing" | grep -Fqx "$$e" || missing="$$missing $$e"; \

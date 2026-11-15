@@ -250,10 +250,10 @@ cmd_save_config() {
     chmod 0600 "$CONF" 2>/dev/null \
         || log_warn "could not chmod 0600 $CONF"
     log_info "saved config to $CONF"
-    # The restart belongs to the reload watcher (service.sh polls the file's
-    # mtime every 5s). Restarting here too would stop+start the daemon twice
-    # per save, and two concurrent restarts can leave a dead pid in
-    # run/wg-user.pid while the survivor holds the port.
+    # The restart belongs to the reload watcher (service.sh compares the
+    # file's content signature every 5s). Restarting here too would stop+start
+    # the daemon twice per save, and two concurrent restarts can leave a dead
+    # pid in run/wg-user.pid while the survivor holds the port.
     log_info "the reload watcher applies it within ~5s"
 }
 

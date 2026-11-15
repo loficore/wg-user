@@ -300,15 +300,23 @@ A working transport is a chain; check it in this order.
 
 ## 8. Troubleshooting
 
-**What the phone logs (0.3.0).** `internal/wstunnel` has no logger. While the
-transport is retrying, the daemon records only the state (`wg-user status`
-prints `transport: reconnecting`) — the underlying error text is *not*
-written to `log/wg-user.log` in 0.3.0. An error appears there only when a
-failure is permanent and ends the process (`wg-user: …`, exit 1). So do not
-wait for a message that will never be printed: use the checks below.
+**What the phone reports (0.3.0).** `internal/wstunnel` has no logger. While
+the transport is retrying, `wg-user status` prints the state and says nothing
+about the cause:
 
-- **`transport: reconnecting` and nothing else.** That means the WebSocket
-  upgrade is not completing. In order:
+```
+wg-user: running (pid 1234)
+last log: <the daemon's last log line>
+transport: wss://your-server.example.com:443 (reconnecting)
+```
+
+`last log:` stays free of transport errors in 0.3.0: the error text is *not*
+written to `log/wg-user.log` while the client retries. A line appears there
+only when a failure is permanent and ends the process (`wg-user: …`, exit 1).
+So do not wait for a message that will never be printed: use the checks below.
+
+- **`transport: <URL> (reconnecting)`, no error text.** That means the
+  WebSocket upgrade is not completing. In order:
   1. Read the **server's** `wstunnel` log — it is the side that knows why
      (bad path, blocked upgrade, refused forward).
   2. Confirm the server was started with `--websocket-mask-frame`; without
@@ -323,8 +331,9 @@ wait for a message that will never be printed: use the checks below.
      error output.
 - **Handshake works, no traffic.** Check `--websocket-mask-frame` first,
   then compare `[Peer] Endpoint` with `--restrict-to`. Both mistakes look
-  identical from the phone: `transport_state=connected`, no WireGuard
-  handshake, nothing in the client log beyond the upgrade.
+  identical from the phone: `transport: wss://… (connected)` in
+  `wg-user status`, no WireGuard handshake, nothing in the client log beyond
+  the upgrade.
 - **`connection refused` / timeout on the phone.** The server is not
   running or TCP 443 is blocked. From another host:
   `curl -vI https://your-server.example.com` should return a TLS banner.

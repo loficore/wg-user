@@ -215,10 +215,11 @@ route on the server side.
 
 ## Hot reload
 
-The module ships a background watcher (started by `service.sh`) that
-polls `etc/wireproxy.conf`'s mtime every 5 seconds. On change it waits 1 s,
-then runs `wg-user reload`. `reload` first runs `wg-user configtest`; if the
-new file is invalid the running daemon is left alone and the error is
+The module ships a background watcher (started by `service.sh`) that checks
+`etc/wireproxy.conf`'s content every 5 seconds (a `cksum` signature — not an
+mtime, so two saves inside the same second are both seen). On change it waits
+1 s, then runs `wg-user reload`. `reload` first runs `wg-user configtest`; if
+the new file is invalid the running daemon is left alone and the error is
 logged. If it passes, the daemon is restarted.
 
 The watcher is the only thing that restarts the daemon for a config edit.

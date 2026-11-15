@@ -121,7 +121,7 @@ wstunnel` replaces that socket with an in-process WebSocket connection.
 | Shared shell lib | `common/util.sh`, `common/abi.sh` | Logging, ABI detection, `select_binary` (each script resolves its own path inline) |
 | Daemon | `bin/wg-user` (~9 MB per arch) | WireGuard + gvisor netstack + SOCKS5/HTTP + the transport, in one process |
 | Config | `etc/wireproxy.conf`, `etc/wireproxy.conf.example` | WG keys, peer, inbounds, `[Transport]` |
-| Hot reload | watcher written by `service.sh` | Polls `etc/wireproxy.conf` mtime; restarts on change |
+| Hot reload | watcher written by `service.sh` | Checks `etc/wireproxy.conf`'s content signature (cksum); restarts on change |
 | WebUI | `webroot/index.html`, `app.js`, `style.css` | Status / control / log / config editor |
 | Build | `Makefile`, `scripts/build.sh` | Cross-compile `wg-user` for 4 architectures |
 
@@ -331,8 +331,10 @@ and never creates a `tunnel.conf`.
 wireproxy does not implement SIGHUP-based config reload. `service.sh`
 therefore writes a small watcher (`wg-user-reload`, `run/watcher.pid`) that:
 
-1. Records the mtime of `etc/wireproxy.conf` on startup.
-2. Every 5 seconds (override with `$WGU_RELOAD_INTERVAL`) compares it.
+1. Records a content signature (`cksum`) of `etc/wireproxy.conf` on startup.
+2. Every 5 seconds (override with `$WGU_RELOAD_INTERVAL`) compares it. A
+   content signature, not an mtime: two saves inside the same second must both
+   be seen.
 3. On change, waits 1 s (debounce), then runs `wg-user reload`.
 4. `wg-user reload` runs `bin/wg-user configtest`; on failure the running
    daemon is left alone and the error is logged. On success it restarts the
@@ -440,7 +442,7 @@ the four `bin/<arch>` directories, and the docs. It carries only
   protocol is implemented.
 - **QUIC/WebTransport (`wqs://`)**: explicit non-goal for 0.3.0; the
   installer degrades such an old URL to `Mode = off`.
-- **In-process config hot reload**: the mtime watcher + restart is enough.
+- **In-process config hot reload**: the content watcher + restart is enough.
 - **Shipping only arm architectures**: a size decision for later.
 
 ## 12. Risks & mitigations
@@ -457,7 +459,7 @@ the four `bin/<arch>` directories, and the docs. It carries only
 | Reconnect changes the server-side UDP source port | Low | WireGuard re-handshakes; the server roams to the new port; device acceptance step 3 covers it |
 | SOCKS5 UDP needed by some intranet app | Low | Document; recommend fallback to direct or L2TP/SS for UDP |
 | Daemon killed by LMK | Low | `oom_score_adj = -1000` set in `wg-user start` |
-| Conf mtime changes during a reload | Low | Watcher debounces by 1 s before re-reading |
+| Conf content changes during a reload | Low | Watcher debounces by 1 s before re-reading; a cksum comparison catches same-second writes |
 | Stale PID file after a crash | Med | `running_pid` validates `/proc/<pid>/cmdline` before signalling; `run/state` is only trusted when its pid matches |
 | WebUI exposes keys via cleartext | Med | Document that WebUI traffic is local; user should not expose the port publicly |
 | Source download blocked in CN | Med | `GOPROXY=https://goproxy.cn,direct` is the build default |

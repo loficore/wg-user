@@ -46,27 +46,32 @@ CONF="$ROOT/etc/wireproxy.conf"
 LOG="$ROOT/log/wg-user.log"
 INTERVAL="${WGU_RELOAD_INTERVAL:-5}"
 
-# mtime <file> — epoch seconds; GNU stat, then BSD stat, then 0.
-mtime() {
-    stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 0
+# sig <file> — a content signature, not a timestamp. The watcher is the only
+# restart path, and `stat -c %Y` has one-second granularity: two saves inside
+# the same second leave the mtime unchanged, so the second write would never be
+# applied while the UI promises "within ~5 s". cksum is POSIX (toybox and
+# busybox ship it) and prints "<CRC> <bytes>"; including the length makes a
+# collision need both a CRC and a length collision.
+sig() {
+    cksum < "$1" 2>/dev/null | awk '{print $1 "-" $2}'
 }
 
-conf_mtime=0
-if [ -f "$CONF" ]; then conf_mtime=$(mtime "$CONF"); fi
+conf_sig=""
+if [ -f "$CONF" ]; then conf_sig=$(sig "$CONF" || true); fi
 
-log_info "reload-watcher started (interval ${INTERVAL}s); watching $CONF"
+log_info "reload-watcher started (interval ${INTERVAL}s); watching $CONF (cksum)"
 
 while :; do
     sleep "$INTERVAL" 2>/dev/null || sleep 5
 
-    cur=0
-    if [ -f "$CONF" ]; then cur=$(mtime "$CONF"); fi
+    cur=""
+    if [ -f "$CONF" ]; then cur=$(sig "$CONF" || true); fi
 
-    [ "$cur" != "$conf_mtime" ] || continue
-    [ "$cur" != "0" ] || continue
+    [ "$cur" != "$conf_sig" ] || continue
+    [ -n "$cur" ] || continue
 
     log_info "config change detected; reloading"
-    conf_mtime=$cur
+    conf_sig=$cur
     sleep 1  # debounce
 
     # `wg-user reload` configtests wireproxy.conf, then restarts the daemon.

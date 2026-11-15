@@ -153,7 +153,7 @@ so removing it is cleanup). In off mode restoring `tunnel.conf` and the
 - One Go cross-compile replaces the second build pipeline; CI now runs the
   full build and the interop test on every pull request, not only on
   release.
-- `service.sh` only starts the daemon and the `etc/wireproxy.conf` mtime
+- `service.sh` only starts the daemon and the `etc/wireproxy.conf` content
   watcher; the reload path is `wg-user reload` after `configtest`.
 - `common/abi.sh::select_binary` replaces
   `select_wireproxy_binary` and installs `bin/<arch>/wg-user` as

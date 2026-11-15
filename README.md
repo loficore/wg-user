@@ -180,29 +180,40 @@ the four binaries, builds the WebUI, zips the module and publishes
 `wg-user-<version>.zip` plus `SHA256SUMS` to a GitHub Release. The tag must
 equal `v$(version)` from `module.prop`.
 
-Cut a release:
+Cut a release only after the pull request's three checks are green and, for a
+change that can affect the running device, after a smoke test on a real phone.
+The full checklist and the hard rules are in [`CONTRIBUTING.md`](CONTRIBUTING.md);
+the short version:
 
 ```bash
 V=$(sed -n 's/^version=//p' module.prop)
 
-# after bumping module.prop (version + versionCode) and webui/package.json:
-make webui                      # rebuild the committed bundle
-jj describe -m "release: $V"
-jj bookmark set main -r @
-jj git push --bookmark main     # -> CI run on main
-jj tag set "v$V" -r main
-jj git push --tag "v$V"         # -> Release run
+# the version bump (module.prop + webui/package.json) arrives through a pull
+# request like any other change; never commit it straight to main.
+git ls-remote --tags origin "refs/tags/v$V"   # must print nothing: never retag
+jj tag set "v$V" -r main                      # main = the merge commit
+jj git push --tag "v$V"                       # -> Release run
 ```
 
-Run the two pushes in the order shown: `jj git push --bookmark main` updates
-the branch, then `jj git push --tag "v$V"` sends the tag. Each command pushes
-only the refs named on its command line, and re-running either is a no-op when
-nothing changed.
+The tag is pushed in the same breath as it is created: a tag that exists only
+on one machine never triggers the release workflow. The tag must equal
+`v$(version)` from `module.prop`. Afterwards, verify what was actually
+published — `gh release download "v$V"`, `sha256sum -c SHA256SUMS`, and the
+`module.prop` inside the zip — rather than assuming the build did what the
+checkout did.
 
 `workflow_dispatch` on the release workflow runs the same build without
 creating a release — useful for verifying the toolchain.
 
 ## Contributing
+
+Read [`CONTRIBUTING.md`](CONTRIBUTING.md) first. The short version:
+
+- no release until the tests and (where relevant) a device smoke test have
+  finished — a published release cannot be taken back;
+- no tag that exists only locally — push it the moment you create it;
+- no direct pushes to `main` — every change, including version bumps and
+  changelog entries, goes through a pull request.
 
 `main` is protected:
 
@@ -219,8 +230,8 @@ jj git push --bookmark my-change
 gh pr create --base main --head my-change --fill
 ```
 
-Tags are not covered by branch protection, so pushing a release tag
-directly is still the release trigger.
+Tags are not covered by branch protection, so the discipline in
+`CONTRIBUTING.md` is what keeps them honest.
 
 ## License
 

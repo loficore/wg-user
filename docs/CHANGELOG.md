@@ -169,6 +169,15 @@ so removing it is cleanup). In off mode restoring `tunnel.conf` and the
 - A dead transport is visible in `wg-user status` instead of requiring a
   log read; `run/state` is only trusted when its `pid` matches the live
   daemon.
+- `wg-user save-config` no longer restarts the daemon itself: it validates
+  the staged file with `configtest` and writes it, and the reload watcher
+  performs the one restart ~5 s later. Every WebUI save used to stop+start
+  the daemon twice, and two overlapping restarts could leave a dead pid in
+  `run/wg-user.pid`. A file that fails `configtest` is now rejected before
+  it replaces the live config.
+- The installer warns when a 0.2.x `wireproxy.conf` has more than one
+  `[Peer]` and `Mode = wstunnel`, instead of migrating "successfully" into
+  a config the daemon refuses on every boot (it requires exactly one peer).
 
 ## [0.2.0] — 2026-11-14
 

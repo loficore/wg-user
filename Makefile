@@ -19,7 +19,17 @@ WEBROOT := $(ROOT_DIR)/webroot
 # the copy already on the device).
 PKG_FILES := module.prop customize.sh uninstall.sh sepolicy.rule service.sh wg-user common/ etc/wireproxy.conf.example webroot/ bin/arm64-v8a bin/armeabi-v7a bin/x86_64 bin/x86 README.md LICENSE docs/INSTALL.md docs/CONFIG.md docs/TUNNEL-SERVER.md docs/CHANGELOG.md docs/ARCHITECTURE.md
 
-.PHONY: build build-go test webui webui-clean clean check-bins package package-only verify interop help FORCE
+# Entries the archive must contain. PKG_FILES is hand-maintained and `zip -r`
+# exits 0 when a named entry is missing (it just leaves it out), so an omission
+# would ship silently; check-archive asserts the result. Paths are relative to
+# the archive root, exactly as zipinfo -1 prints them.
+PKG_REQUIRED := module.prop wg-user service.sh customize.sh uninstall.sh \
+	common/util.sh common/abi.sh webroot/app.js webroot/index.html \
+	etc/wireproxy.conf.example \
+	bin/arm64-v8a/wg-user bin/armeabi-v7a/wg-user \
+	bin/x86_64/wg-user bin/x86/wg-user
+
+.PHONY: build build-go test webui webui-clean clean check-bins check-archive package package-only verify interop help FORCE
 
 help:
 	@echo "make build      - cross-compile the single wg-user binary for 4 arches"
@@ -78,11 +88,44 @@ check-bins:
 	    exit 1; \
 	fi
 
+# Assert the archive just written has every required entry. Runs after the zip
+# step (zip exits 0 for a missing PKG_FILES entry). The tar fallback only happens
+# when zip is absent, i.e. when zipinfo is absent too; it is reported, not checked.
+check-archive:
+	@set -e; \
+	zip="$(DIST)/wg-user-$(VERSION).zip"; \
+	tarball="$(DIST)/wg-user-$(VERSION).tar.gz"; \
+	if [ ! -f "$$zip" ]; then \
+	    if [ -f "$$tarball" ]; then \
+	        echo "  archive check: SKIPPED ($$tarball; check assumes a zip)"; \
+	        exit 0; \
+	    fi; \
+	    echo "ERROR: no archive in $(DIST)"; \
+	    exit 1; \
+	fi; \
+	listing=$$(zipinfo -1 "$$zip"); \
+	missing=""; \
+	for e in $(PKG_REQUIRED); do \
+	    printf '%s\n' "$$listing" | grep -Fqx "$$e" || missing="$$missing $$e"; \
+	done; \
+	if [ -n "$$missing" ]; then \
+	    echo "ERROR: $$zip is missing mandatory entries:"; \
+	    for e in $$missing; do echo "         $$e"; done; \
+	    echo "       Fix PKG_FILES in the Makefile and re-run 'make package'."; \
+	    rm -f "$$zip"; \
+	    exit 1; \
+	fi; \
+	echo "  archive check: all $(words $(PKG_REQUIRED)) required entries present in $$zip"
+
 package: build check-bins webui
 	@echo "==> packaging wg-user v$(VERSION)..."
 	@mkdir -p $(DIST)
+	@# Start from a clean archive: `zip -r` updates an existing one, so an entry
+	@# that left PKG_FILES would otherwise survive inside the new package.
+	@rm -f $(DIST)/wg-user-$(VERSION).zip $(DIST)/wg-user-$(VERSION).tar.gz
 	@cd $(ROOT_DIR) && zip -r $(DIST)/wg-user-$(VERSION).zip $(PKG_FILES) 2>/dev/null || \
 	  (echo "zip not found, trying tar:" && tar czf $(DIST)/wg-user-$(VERSION).tar.gz $(PKG_FILES))
+	@$(MAKE) --no-print-directory check-archive
 	@ls -lh $(DIST)
 
 # Same archive, but without re-running the cross-compiles. Use after
@@ -90,8 +133,10 @@ package: build check-bins webui
 package-only: check-bins webui
 	@echo "==> packaging wg-user v$(VERSION) (no rebuild)..."
 	@mkdir -p $(DIST)
+	@rm -f $(DIST)/wg-user-$(VERSION).zip $(DIST)/wg-user-$(VERSION).tar.gz
 	@cd $(ROOT_DIR) && zip -r $(DIST)/wg-user-$(VERSION).zip $(PKG_FILES) 2>/dev/null || \
 	  (echo "zip not found, trying tar:" && tar czf $(DIST)/wg-user-$(VERSION).tar.gz $(PKG_FILES))
+	@$(MAKE) --no-print-directory check-archive
 	@ls -lh $(DIST)
 
 # No Go toolchain and no built binaries required: syntax-check every script

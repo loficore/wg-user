@@ -221,6 +221,11 @@ then runs `wg-user reload`. `reload` first runs `wg-user configtest`; if the
 new file is invalid the running daemon is left alone and the error is
 logged. If it passes, the daemon is restarted.
 
+The watcher is the only thing that restarts the daemon for a config edit.
+`wg-user save-config` (used by the WebUI editor) validates the staged file
+and writes it; it does **not** reload, so one save is one restart, not two.
+`wg-user reload` and `wg-user restart` are the manual equivalents.
+
 A `[Transport]` change is just a config change: the daemon rebuilds the
 transport from the new file on restart.
 
@@ -238,7 +243,7 @@ You can trigger reload manually: `wg-user reload`.
 | `wg-user reload` | Configtest + restart (only if configtest passes). |
 | `wg-user status` | Print pid, last log line, and the transport line from `run/state`. Exit 1 when stopped. |
 | `wg-user log [N]` | Tail N lines of `log/wg-user.log` (default 50). |
-| `wg-user save-config <path>` | Copy file to `etc/wireproxy.conf` (0600), then reload. |
+| `wg-user save-config <path>` | Validate `<path>` with `configtest`, then copy it to `etc/wireproxy.conf` (0600). The reload watcher applies it within ~5 s; `save-config` does not restart the daemon itself. A file that fails `configtest` is rejected and the live config is kept. |
 | `wg-user version` | Print the module version. |
 
 The binary itself: `bin/wg-user run [-c FILE] [-v]` (the default

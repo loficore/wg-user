@@ -36,6 +36,12 @@ What to check in the install log:
   not verify certificates when the key was absent, and the migration
   preserves that. Set `Insecure = false` in `etc/wireproxy.conf` if your
   server has a trusted certificate.
+- `… has N [Peer] sections; wstunnel mode supports exactly one peer …` —
+  your `wireproxy.conf` has more than one `[Peer]`. `Mode = wstunnel`
+  supports exactly one (the transport carries a single peer), so the
+  daemon will refuse to start with exit 2 until the extra `[Peer]` blocks
+  are deleted. The migration rewrote `Endpoint` in all of them, so keep
+  the peer you want and remove the rest.
 
 **Server-side check (0.3.0 only).** The official `wstunnel server` on the
 VPS must be started with `--websocket-mask-frame`. 0.2.0 did not need it;

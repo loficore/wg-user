@@ -27,9 +27,9 @@ export const en = {
     'config.title': 'Config',
     'config.path': '(etc/wireproxy.conf)',
     'config.load': 'Load',
-    'config.save': 'Save & Reload',
+    'config.save': 'Save',
     'config.loaded': 'Loaded.',
-    'config.saved': 'Saved & reloaded.',
+    'config.saved': 'Saved. The reload watcher restarts the daemon within ~5 s.',
     'config.loadError': 'Load error: {msg}',
     'config.saveError': 'Save error: {msg}',
 

@@ -106,7 +106,7 @@ not on `PATH`):
 | `reload` | `wg-user configtest` on `etc/wireproxy.conf`; restart only if it passes. |
 | `status` | Print pid, the last log line, and the transport line from `run/state`; exit 1 when stopped. |
 | `log [N]` | Tail N lines of `log/wg-user.log` (default 50). |
-| `save-config <path>` | Copy `<path>` to `etc/wireproxy.conf` (0600) and reload. |
+| `save-config <path>` | Validate `<path>` with `configtest`, then copy it to `etc/wireproxy.conf` (0600). Restart happens via the reload watcher (within ~5 s), not here; an invalid file is rejected and the live config is left untouched. |
 | `version` | Print the module version from `module.prop`. |
 
 The binary itself has three subcommands: `run` (the default), `configtest`

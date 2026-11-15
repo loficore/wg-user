@@ -343,6 +343,19 @@ migrate_tunnel_conf() {
         mode=off
     fi
 
+    # wstunnel mode carries exactly one [Peer] (internal/config: "transport mode
+    # \"wstunnel\" requires exactly one [Peer]"). The rewrite below touches
+    # Endpoint in every peer block, so a 0.2.x file with several peers would
+    # migrate "successfully" and then exit 2 on every boot, with no install-time
+    # signal. Which peer to keep is the user's call, so warn rather than pick:
+    # the daemon will keep refusing the file until the extras are removed.
+    if [ "$mode" = wstunnel ]; then
+        peers=$(grep -ci '^[[:space:]]*\[peer\]' "$new" 2>/dev/null || true)
+        if [ "${peers:-0}" -gt 1 ]; then
+            log_warn "etc/wireproxy.conf has $peers [Peer] sections; wstunnel mode supports exactly one peer, and the daemon will refuse to start (exit 2) until the extra ones are removed. See docs/CONFIG.md — [Peer]."
+        fi
+    fi
+
     user=$(old_conf_value "$old" username)
     pass=$(old_conf_value "$old" password)
 

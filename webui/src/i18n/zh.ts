@@ -25,9 +25,9 @@ export const zh: Catalogue = {
     'config.title': '配置',
     'config.path': '（etc/wireproxy.conf）',
     'config.load': '读取',
-    'config.save': '保存并重载',
+    'config.save': '保存',
     'config.loaded': '已读取。',
-    'config.saved': '已保存并重载。',
+    'config.saved': '已保存，reload 观察器将在约 5 秒内重启守护进程。',
     'config.loadError': '读取失败：{msg}',
     'config.saveError': '保存失败：{msg}',
 

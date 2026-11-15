@@ -205,7 +205,7 @@ The shell CLI keeps the process boundary thin:
 | `reload` | `bin/wg-user configtest -c etc/wireproxy.conf`; restart only if it exits 0 |
 | `status` | pid + `transport: <detail> (<state>)`; `run/state` is only trusted when its `pid` matches the live pid |
 | `log [N]` | `tail -n N log/wg-user.log` (default 50) |
-| `save-config <path>` | copy to `etc/wireproxy.conf` (0600), then reload |
+| `save-config <path>` | `configtest -c <path>`; only on success copy to `etc/wireproxy.conf` (0600). Does not restart — the reload watcher applies the file within ~5 s |
 | `version` | `version=` from `module.prop` |
 
 ## 7. Transport layer (in-process)
@@ -376,7 +376,9 @@ UI sections:
   `ksu.exec('/data/adb/modules/wg-user/wg-user log 50')`
 - **Config editor**: `<textarea>` populated via
   `cat /data/adb/modules/wg-user/etc/wireproxy.conf`, saved via
-  `wg-user save-config <staged-file>`. On save, the CLI reloads the daemon.
+  `wg-user save-config <staged-file>`. On save, the CLI validates the file
+  and writes it; the reload watcher restarts the daemon within ~5 s (so one
+  save is one restart).
 
 There is no separate tunnel card: the transport is part of the one config
 file and its live state is part of the status card.

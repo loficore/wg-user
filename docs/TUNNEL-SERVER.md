@@ -300,6 +300,27 @@ A working transport is a chain; check it in this order.
 
 ## 8. Troubleshooting
 
+**What the phone logs (0.3.0).** `internal/wstunnel` has no logger. While the
+transport is retrying, the daemon records only the state (`wg-user status`
+prints `transport: reconnecting`) — the underlying error text is *not*
+written to `log/wg-user.log` in 0.3.0. An error appears there only when a
+failure is permanent and ends the process (`wg-user: …`, exit 1). So do not
+wait for a message that will never be printed: use the checks below.
+
+- **`transport: reconnecting` and nothing else.** That means the WebSocket
+  upgrade is not completing. In order:
+  1. Read the **server's** `wstunnel` log — it is the side that knows why
+     (bad path, blocked upgrade, refused forward).
+  2. Confirm the server was started with `--websocket-mask-frame`; without
+     it the client retries forever.
+  3. Run `wg-user configtest -c /data/adb/modules/wg-user/etc/wireproxy.conf`
+     on the phone. It catches a malformed `URL`/`Path` locally.
+  4. Prove reachability outside the module: from another host,
+     `curl -i https://your-server.example.com/` (a TLS answer, any status,
+     means DNS and TCP 443 work), and if you have the client binary,
+     `wstunnel client -L 'udp://127.0.0.1:51820:127.0.0.1:51820?timeout_sec=0'
+     wss://your-server.example.com:443` reproduces the handshake with
+     error output.
 - **Handshake works, no traffic.** Check `--websocket-mask-frame` first,
   then compare `[Peer] Endpoint` with `--restrict-to`. Both mistakes look
   identical from the phone: `transport_state=connected`, no WireGuard
@@ -309,11 +330,11 @@ A working transport is a chain; check it in this order.
   `curl -vI https://your-server.example.com` should return a TLS banner.
 - **HTTP 404 on the upgrade.** `[Transport] Path` and
   `--restrict-http-upgrade-path-prefix` disagree. Both default to `v1`.
-- **TLS error in `log/wg-user.log`** (`x509: certificate signed by unknown
-  authority`, hostname mismatch). The client does not retry certificate
-  errors; it exits 1. Fix the certificate, use the certificate's hostname
-  in `URL`, or — for a self-signed server you control — set
-  `Insecure = true`.
+- **A permanent TLS/config failure.** A certificate error (hostname
+  mismatch, unknown authority) that does not retry ends the process: the
+  daemon logs `wg-user: …` to `log/wg-user.log` and exits 1. Fix the
+  certificate, use the certificate's hostname in `URL`, or — for a
+  self-signed server you control — set `Insecure = true`.
 - **The server refuses to forward.** Check the `wstunnel` log for a
   `--restrict-to` rejection: the requested target must be one of the
   allowed addresses.

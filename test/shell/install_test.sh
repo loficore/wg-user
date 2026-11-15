@@ -563,4 +563,73 @@ printf '%s\n' "$out" | grep -F 'Endpoint must be the real WireGuard server addre
 $out"
 pass "wstunnel without URL becomes off"
 
+# ---------- N. multi-[Peer] wstunnel upgrade warns ----------
+
+# internal/config rejects wstunnel mode unless there is exactly one [Peer]. The
+# migration rewrites Endpoint in every peer block and cannot know which peer the
+# user wants, so a two-peer 0.2.x file would migrate "successfully" and then
+# exit 2 on every boot with no install-time signal. The installer must warn, and
+# still complete the migration.
+printf '== N. multi-[Peer] wstunnel upgrade warns\n'
+mod="$TMP/n"
+upgrade_module "$mod"
+cat >> "$mod/etc/wireproxy.conf" <<'CONF_EOF'
+
+[peer]
+PublicKey = <old-pub-2>
+Endpoint = 127.0.0.1:51820
+AllowedIPs = 10.66.0.0/24
+CONF_EOF
+cat > "$mod/etc/tunnel.conf" <<'CONF_EOF'
+mode = wstunnel
+
+[wstunnel]
+remote = wss://x:443
+remote-udp = 127.0.0.1:51999
+CONF_EOF
+if ! out=$(run_install "$mod" 2>&1); then
+    fail "customize.sh exited non-zero on a two-peer upgrade:
+$out"
+fi
+printf '%s\n' "$out" | grep -F '2 [Peer] sections' >/dev/null \
+    || fail "expected the warning to count both [Peer] sections (case-insensitively):
+$out"
+printf '%s\n' "$out" | grep -F 'wstunnel mode supports exactly one peer' >/dev/null \
+    || fail "expected the warning to say wstunnel mode supports one peer:
+$out"
+printf '%s\n' "$out" | grep -F 'refuse to start' >/dev/null \
+    || fail "expected the warning to say the daemon will refuse the config:
+$out"
+# The migration still completes: [Transport] is written once and Endpoint is
+# rewritten in both blocks (the daemon, not the installer, rejects the file).
+assert_line 'Mode = wstunnel' "$mod/etc/wireproxy.conf"
+assert_count 'Endpoint = 127.0.0.1:51999' "$mod/etc/wireproxy.conf" 2
+assert_count '[Transport]' "$mod/etc/wireproxy.conf" 1
+assert_absent "$mod/etc/tunnel.conf"
+assert_exists "$mod/etc/tunnel.conf.migrated"
+pass "multi-peer warning"
+
+# A single-peer upgrade must stay quiet: the warning is only for the case the
+# daemon cannot accept.
+printf '== N2. a single [Peer] wstunnel upgrade does not warn\n'
+mod="$TMP/n2"
+upgrade_module "$mod"
+cat > "$mod/etc/tunnel.conf" <<'CONF_EOF'
+mode = wstunnel
+
+[wstunnel]
+remote = wss://x:443
+remote-udp = 127.0.0.1:51999
+CONF_EOF
+if ! out=$(run_install "$mod" 2>&1); then
+    fail "customize.sh exited non-zero on a single-peer upgrade:
+$out"
+fi
+if printf '%s\n' "$out" | grep -F 'supports exactly one peer' >/dev/null; then
+    fail "single-peer upgrade warned about peer count:
+$out"
+fi
+assert_line 'Endpoint = 127.0.0.1:51999' "$mod/etc/wireproxy.conf"
+pass "single peer stays quiet"
+
 printf 'PASS: install_test\n'

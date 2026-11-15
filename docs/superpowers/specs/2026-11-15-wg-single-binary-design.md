@@ -234,12 +234,12 @@ updated=1763000000
 | 子命令 | 0.3.0 行为 |
 |---|---|
 | `start` | `nohup bin/wg-user run -c etc/wireproxy.conf > log/wg-user.log 2>&1 &`，写 `run/wg-user.pid`，设 `oom_score_adj=-1000`，1 秒后确认存活 |
-| `stop` | 对 pid 发 SIGINT，等待 ≤5 秒，必要时 SIGTERM |
+| `stop` | 对 pid 发 SIGTERM，最多轮询 20 秒，仍未退出则 SIGKILL；SIGKILL 后仍存活则报错（不谎报成功） |
 | `restart` | stop + start |
 | `reload` | `bin/wg-user configtest` 通过后 restart |
 | `status` | `wg-user: running (pid N)` + `transport: <detail> (<state>)`；未运行则 `wg-user: stopped` 且退出码 1 |
 | `log [N]` | `tail -n N log/wg-user.log`（默认 50） |
-| `save-config <path>` | 写入 `etc/wireproxy.conf` 后 reload |
+| `save-config <path>` | 先 `configtest` 暂存文件，通过后写入 `etc/wireproxy.conf`（0600）；不自行重启，由 reload 观察器在 ~5 秒内应用 |
 | `version` | 打印 `module.prop` 的 `version` |
 
 `status` 以 `run/wg-user.pid` 为准并校验进程存活；进程已死时忽略 `run/state` 的残留内容（被 SIGKILL 时不会清理）。

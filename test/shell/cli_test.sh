@@ -61,9 +61,13 @@ printf '[Interface]\nAddress = 10.0.0.2/32\n' > "$MOD/etc/wireproxy.conf"
 cat > "$MOD/bin/wg-user" <<'STUB'
 #!/bin/sh
 # Stand-in for the Go daemon. `run` writes a fixed log, then stays up: that is
-# all the CLI's start/stop/status/log paths care about.
+# all the CLI's start/stop/status/log paths care about. Every invocation is
+# appended to run/stub-calls so the tests can assert which subcommands ran (and
+# how often) without timing races.
+calls="$(dirname -- "$0")/../run/stub-calls"
 case "${1:-run}" in
     run)
+        printf '%s\n' "$*" >> "$calls"
         i=0
         while [ "$i" -lt 10 ]; do
             printf 'stub log line %s\n' "$i"
@@ -72,9 +76,22 @@ case "${1:-run}" in
         while :; do sleep 1; done
         ;;
     configtest)
+        printf '%s\n' "$*" >> "$calls"
+        # The staged file is named by -c; a config containing INVALID stands in
+        # for the Go parser rejecting it.
+        staged=""
+        while [ "$#" -gt 0 ]; do
+            if [ "$1" = "-c" ]; then shift; staged="${1:-}"; fi
+            shift
+        done
+        if [ -n "$staged" ] && grep -q INVALID "$staged" 2>/dev/null; then
+            printf 'configtest: %s: unknown section\n' "$staged" >&2
+            exit 2
+        fi
         printf 'Config OK\n'
         ;;
     version)
+        printf '%s\n' "$*" >> "$calls"
         printf 'wg-user 0.9.9\n'
         ;;
     *)
@@ -245,9 +262,20 @@ kill -0 "$decoy" 2>/dev/null \
     || fail "stop signalled the unrelated process (pid $decoy is gone)"
 must_not_contain 'wg-user not running' "$out"
 
-# ---------- save-config copies the file and reloads (configtest + restart) ----------
+# ---------- save-config validates + copies; the watcher owns the restart ----------
+# service.sh's watcher restarts the daemon whenever etc/wireproxy.conf's mtime
+# changes. save-config must not also stop+start: that is two restarts per WebUI
+# save (and two concurrent restarts can leave a dead pid in run/wg-user.pid).
 
 printf '== save-config\n'
+calls="$MOD/run/stub-calls"
+rc=0
+out=$(cli start) || rc=$?
+[ "$rc" -eq 0 ] || fail "start (before save-config): exit $rc, want 0
+$out"
+daemon_pid=$(cat "$MOD/run/wg-user.pid")
+runs_before=$(grep -c '^run' "$calls" 2>/dev/null || true)
+
 printf '[Interface]\nAddress = 10.0.0.9/32\n' > "$TMP/new.conf"
 rc=0
 out=$(cli save-config "$TMP/new.conf") || rc=$?
@@ -255,8 +283,33 @@ out=$(cli save-config "$TMP/new.conf") || rc=$?
 $out"
 cmp -s "$TMP/new.conf" "$MOD/etc/wireproxy.conf" \
     || fail "save-config: etc/wireproxy.conf was not replaced"
-[ -f "$MOD/run/wg-user.pid" ] || fail "save-config: reload did not start the daemon"
-daemon_pid=$(cat "$MOD/run/wg-user.pid")
+# (a) the staged file itself was validated, not the live config.
+grep -F -x -- "configtest -c $TMP/new.conf" "$calls" >/dev/null \
+    || fail "save-config did not configtest the staged file:
+$(cat "$calls")"
+# (b) no restart from save-config: same daemon, same pid, no new `run`.
+[ -f "$MOD/run/wg-user.pid" ] || fail "save-config: daemon pidfile disappeared"
+[ "$(cat "$MOD/run/wg-user.pid")" = "$daemon_pid" ] \
+    || fail "save-config restarted the daemon (pid ${daemon_pid} -> $(cat "$MOD/run/wg-user.pid"))"
+runs_after=$(grep -c '^run' "$calls" 2>/dev/null || true)
+[ "$runs_after" = "$runs_before" ] \
+    || fail "save-config started the daemon $((runs_after - runs_before)) time(s); the watcher owns that restart"
+must_contain 'within ~5s' "$out"
+
+# (c) a config that fails configtest is rejected before it lands on disk.
+printf '== save-config rejects an invalid config\n'
+cp -f "$MOD/etc/wireproxy.conf" "$TMP/before-bad.conf"
+printf '[Interface]\nINVALID\n' > "$TMP/bad.conf"
+rc=0
+out=$(cli save-config "$TMP/bad.conf") || rc=$?
+[ "$rc" -ne 0 ] || fail "save-config accepted a config that failed configtest
+$out"
+cmp -s "$TMP/before-bad.conf" "$MOD/etc/wireproxy.conf" \
+    || fail "save-config replaced the live config with an invalid file"
+must_contain 'configtest FAILED' "$out"
+[ "$(cat "$MOD/run/wg-user.pid")" = "$daemon_pid" ] \
+    || fail "save-config restarted the daemon after a failed configtest"
+
 rc=0
 out=$(cli stop) || rc=$?
 [ "$rc" -eq 0 ] || fail "stop (after save-config): exit $rc, want 0

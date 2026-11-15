@@ -1,197 +1,111 @@
 #!/system/bin/sh
 # wg-user — control script for the WireGuard userspace proxy module.
 #
+# One binary, one process: `bin/wg-user run` owns the WireGuard device and,
+# when [Transport] Mode = wstunnel, the WebSocket transport as well.
+#
 # Top-level subcommands:
-#   start                  — start wstunnel (if enabled) then wireproxy
-#   stop                   — stop wireproxy then wstunnel
+#   start                  — start the daemon in the background
+#   stop                   — SIGTERM, wait up to 20s, then SIGKILL
 #   restart                — stop + start
 #   reload                 — configtest; on success, stop+start
-#   status                 — print status of wireproxy + tunnel
-#   log [daemon] [N]       — tail N lines of wireproxy.log or wstunnel.log
-#   save-config <path>     — copy file to wireproxy.conf; triggers reload
+#   status                 — running state + transport line from run/state
+#   log [N]                — tail N lines (default 50) of log/wg-user.log
+#   save-config <path>     — configtest it, copy to wireproxy.conf; the
+#                            reload watcher restarts the daemon within ~5s
 #   version                — module version
 #
-#   tunnel start|stop|status|restart   — sub-namespace for wstunnel
-#
-# All subcommands exit 0 on success, 1 on error.
+# All subcommands exit 0 on success, 1 on error, 2 on a usage error.
 
 set -eu
 
-SELF="$0"
 ROOT="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 . "$ROOT/common/util.sh"
-. "$ROOT/common/abi.sh"
 
-WPPIDFILE="$ROOT/run/wireproxy.pid"
-TNPIDFILE="$ROOT/run/wstunnel.pid"
-WPLOG="$ROOT/log/wireproxy.log"
-TNLOG="$ROOT/log/wstunnel.log"
-WPCONF="$ROOT/etc/wireproxy.conf"
-TNCONF="$ROOT/etc/tunnel.conf"
-BINWP="$ROOT/bin/wireproxy"
-BINTN="$ROOT/bin/wstunnel"
+PIDFILE="$ROOT/run/wg-user.pid"
+STATEFILE="$ROOT/run/state"
+LOG="$ROOT/log/wg-user.log"
+CONF="$ROOT/etc/wireproxy.conf"
+BIN="$ROOT/bin/wg-user"
 mkdir -p "$ROOT/run" "$ROOT/log"
 
-# ---------- tunnel config helpers ----------
+# How long SIGTERM gets before SIGKILL. The Go daemon may spend up to 10s
+# finishing an in-flight UDP write and then rewrites the log and state file, so
+# a shorter window would truncate its last output. Polled twice a second.
+STOP_TIMEOUT=20
+STOP_POLLS=$((STOP_TIMEOUT * 2))
 
-tunnel_enabled() {
-    [ -f "$TNCONF" ] || return 1
-    grep -Eq '^[[:space:]]*mode[[:space:]]*=[[:space:]]*(wstunnel)' "$TNCONF"
+# ---------- helpers ----------
+
+# state_value <key> — echo the value of key in run/state, or nothing when the
+# file is absent or lacks the key. The keys are the Go state package's contract.
+state_value() {
+    [ -f "$STATEFILE" ] || return 0
+    sed -n "s/^$1=//p" "$STATEFILE" | head -n 1
 }
 
-tunnel_local_addr() {
-    awk -F'[[:space:]]*=[[:space:]]*' \
-        '/^[[:space:]]*local-udp[[:space:]]*=/{print $2; exit}' "$TNCONF" 2>/dev/null
-}
-
-tunnel_remote_url() {
-    awk -F'[[:space:]]*=[[:space:]]*' \
-        '/^[[:space:]]*remote[[:space:]]*=/{print $2; exit}' "$TNCONF" 2>/dev/null
-}
-
-# Address the *server* forwards to (as seen from the server), e.g. its local
-# WireGuard listener. wstunnel v11's -L needs BIND:PORT:HOST:PORT, so the
-# client cannot infer this from local-udp.
-tunnel_remote_udp() {
-    awk -F'[[:space:]]*=[[:space:]]*' \
-        '/^[[:space:]]*remote-udp[[:space:]]*=/{print $2; exit}' "$TNCONF" 2>/dev/null
-}
-
-# insecure = true  -> leave wstunnel's default (certificate verification OFF)
-# insecure absent/false -> pass --tls-verify-certificate
-tunnel_verify_cert() {
-    grep -Eqi '^[[:space:]]*insecure[[:space:]]*=[[:space:]]*(false|no|0)' "$TNCONF" 2>/dev/null
-}
-
-tunnel_auth() {
-    u=$(awk -F'[[:space:]]*=[[:space:]]*' '/^[[:space:]]*username[[:space:]]*=/{print $2; exit}' "$TNCONF" 2>/dev/null)
-    p=$(awk -F'[[:space:]]*=[[:space:]]*' '/^[[:space:]]*password[[:space:]]*=/{print $2; exit}' "$TNCONF" 2>/dev/null)
-    if [ -n "$u" ] && [ -n "$p" ]; then echo "$u:$p"; fi
-}
-
-# ---------- tunnel lifecycle ----------
-
-# spawn_tunnel <args...> — start wstunnel, wait a moment, return 0 if it stayed up.
-# A restart kills the old client and immediately starts a new one; the old
-# socket can still be bound for a few hundred ms, which makes the new client
-# exit at once. The caller retries after a short sleep.
-spawn_tunnel() {
-    nohup "$BINTN" "$@" > "$TNLOG" 2>&1 &
-    pid=$!
-    echo "$pid" > "$TNPIDFILE"
+# wait_for_exit <pid> — 0 once the process is gone, 1 if it outlived the window.
+wait_for_exit() {
     i=0
-    while [ $i -lt 5 ]; do
-        sleep 0.2
-        is_running "$TNPIDFILE" || return 1
+    while [ "$i" -lt "$STOP_POLLS" ]; do
+        kill -0 "$1" 2>/dev/null || return 0
+        sleep 0.5
         i=$((i + 1))
     done
-    return 0
+    ! kill -0 "$1" 2>/dev/null
 }
 
-cmd_tunnel_start() {
-    if ! tunnel_enabled; then
-        log_info "tunnel disabled in $TNCONF (mode = off)"
-        return 0
-    fi
-    if [ ! -x "$BINTN" ]; then
-        log_err "tunnel enabled but wstunnel binary missing: $BINTN"
-        return 1
-    fi
-    if is_running "$TNPIDFILE"; then
-        log_info "tunnel already running (pid $(cat "$TNPIDFILE"))"
-        return 0
-    fi
-    local_addr=$(tunnel_local_addr); local_addr=${local_addr:-127.0.0.1:51820}
-    remote_url=$(tunnel_remote_url)
-    if [ -z "$remote_url" ]; then
-        log_err "$TNCONF: missing 'remote' URL (e.g. wss://server:443)"
-        return 1
-    fi
-    auth=$(tunnel_auth)
-    remote_udp=$(tunnel_remote_udp); remote_udp=${remote_udp:-127.0.0.1:51820}
-
-    verify=""
-    if tunnel_verify_cert; then verify="--tls-verify-certificate"; fi
-
-    # wstunnel v11 syntax:
-    #   - the server URL is a POSITIONAL argument (there is no -F)
-    #   - -L is  udp://[BIND:]PORT:HOST:PORT
-    #   - timeout_sec=0 disables the default 30s idle teardown, which would
-    #     otherwise kill the WireGuard session
-    #   - basic auth for the upgrade request is --http-upgrade-credentials
-    log_info "starting wstunnel: udp/$local_addr -> ($remote_url) -> $remote_udp"
-    set -- client -L "udp://$local_addr:$remote_udp?timeout_sec=0"
-    if [ -n "$verify" ]; then set -- "$@" "$verify"; fi
-    if [ -n "$auth" ]; then set -- "$@" --http-upgrade-credentials "$auth"; fi
-    set -- "$@" "$remote_url"
-
-    if ! spawn_tunnel "$@"; then
-        log_warn "wstunnel exited right after start; retrying once in 1s"
-        sleep 1
-        if ! spawn_tunnel "$@"; then
-            log_err "wstunnel failed to start twice. Last log:"
-            tail -n 20 "$TNLOG" >&2
-            return 1
-        fi
-    fi
-    log_info "tunnel started (pid $pid) on udp/$local_addr"
+# pid_is_wguser <pid> — 0 when /proc/<pid>/cmdline is this module's daemon.
+# A pidfile on /data/adb outlives crashes, and after an unclean reboot the pid
+# may belong to a completely unrelated process; never trust or signal it
+# without this check. An unreadable cmdline fails closed (pid is not ours).
+#
+# Only argv[0] and argv[1] are compared. The real daemon is launched as
+# "$BIN" run -c … (argv[0]); a shebang script shows the interpreter in argv[0]
+# and the script path in argv[1]. Comparing those two positions — rather than
+# "the path appears somewhere in argv" — keeps a stranger that merely carries
+# the path as an argument (`sh -c 'sleep 300' _ "$BIN"`, where it lands after
+# argv[1]) from being adopted and signalled.
+pid_is_wguser() {
+    [ -r "/proc/$1/cmdline" ] || return 1
+    _argv0=$(tr '\0' '\n' < "/proc/$1/cmdline" 2>/dev/null | sed -n '1p')
+    _argv1=$(tr '\0' '\n' < "/proc/$1/cmdline" 2>/dev/null | sed -n '2p')
+    [ "$_argv0" = "$BIN" ] || [ "$_argv1" = "$BIN" ]
 }
 
-cmd_tunnel_stop() {
-    if ! is_running "$TNPIDFILE"; then
-        rm -f "$TNPIDFILE"
-        log_info "tunnel not running"
-        return 0
-    fi
-    pid=$(cat "$TNPIDFILE")
-    log_info "stopping wstunnel (pid $pid)..."
-    kill -INT "$pid" 2>/dev/null || true
-    i=0
-    while [ $i -lt 30 ] && kill -0 "$pid" 2>/dev/null; do
-        sleep 0.1
-        i=$((i + 1))
-    done
-    kill -0 "$pid" 2>/dev/null && kill -TERM "$pid" 2>/dev/null || true
-    rm -f "$TNPIDFILE"
-    log_info "tunnel stopped"
+# running_pid — echo the pidfile's pid iff it is alive and is our daemon.
+# Returns 1, printing nothing, for a missing, stale or reused pidfile.
+running_pid() {
+    [ -f "$PIDFILE" ] || return 1
+    _pid=$(cat "$PIDFILE" 2>/dev/null) || return 1
+    [ -n "$_pid" ] || return 1
+    kill -0 "$_pid" 2>/dev/null || return 1
+    pid_is_wguser "$_pid" || return 1
+    echo "$_pid"
 }
 
-cmd_tunnel_status() {
-    if ! tunnel_enabled; then
-        echo "tunnel: disabled"
-        return 0
-    fi
-    if is_running "$TNPIDFILE"; then
-        echo "tunnel: running (pid $(cat "$TNPIDFILE"))"
-    else
-        echo "tunnel: stopped"
-        return 1
-    fi
-}
-
-# ---------- wireproxy lifecycle ----------
+# ---------- lifecycle ----------
 
 cmd_start() {
-    # Order matters: tunnel first, then wireproxy.
-    cmd_tunnel_start || { log_err "tunnel failed to start; aborting"; return 1; }
-
-    if is_running "$WPPIDFILE"; then
-        log_info "wireproxy already running (pid $(cat "$WPPIDFILE"))"
+    if pid=$(running_pid); then
+        log_info "wg-user already running (pid $pid)"
         return 0
     fi
-    if [ ! -x "$BINWP" ]; then
-        log_err "binary not installed: $BINWP. Run 'customize.sh' or 'install.sh'."
+    if [ ! -x "$BIN" ]; then
+        log_err "binary not installed: $BIN. Run 'customize.sh' or 'install.sh'."
         return 1
     fi
-    if [ ! -f "$WPCONF" ]; then
-        log_err "config not found: $WPCONF"
+    if [ ! -f "$CONF" ]; then
+        log_err "config not found: $CONF"
         return 1
     fi
 
-    log_info "starting wireproxy..."
-    nohup "$BINWP" -c "$WPCONF" > "$WPLOG" 2>&1 &
+    log_info "starting wg-user..."
+    nohup "$BIN" run -c "$CONF" > "$LOG" 2>&1 &
     pid=$!
-    echo "$pid" > "$WPPIDFILE"
+    # temp + rename, like internal/state: the WebUI polls status every 5s and
+    # must never read a half-written pidfile.
+    printf '%s\n' "$pid" > "$PIDFILE.tmp" && mv -f "$PIDFILE.tmp" "$PIDFILE"
 
     if [ -e "/proc/$pid/oom_score_adj" ]; then
         echo -1000 > "/proc/$pid/oom_score_adj" 2>/dev/null \
@@ -200,33 +114,48 @@ cmd_start() {
     fi
 
     sleep 1
-    if ! is_running "$WPPIDFILE"; then
-        log_err "wireproxy exited immediately. Last log:"
-        tail -n 20 "$WPLOG" >&2
+    if ! running_pid >/dev/null; then
+        log_err "wg-user exited immediately. Last log:"
+        tail -n 20 "$LOG" >&2
+        rm -f "$PIDFILE"
         return 1
     fi
-    log_info "wireproxy started (pid $pid). Logs: $WPLOG"
+    log_info "wg-user started (pid $pid). Logs: $LOG"
 }
 
 cmd_stop() {
-    if is_running "$WPPIDFILE"; then
-        pid=$(cat "$WPPIDFILE")
-        log_info "stopping wireproxy (pid $pid)..."
-        kill -INT "$pid" 2>/dev/null || true
+    if ! pid=$(running_pid); then
+        # Gone, or a pidfile naming a stranger: dropping the file is safe,
+        # signalling it is not.
+        rm -f "$PIDFILE"
+        log_info "wg-user not running"
+        return 0
+    fi
+    log_info "stopping wg-user (pid $pid)..."
+    kill -TERM "$pid" 2>/dev/null || true
+
+    if wait_for_exit "$pid"; then
+        log_info "wg-user stopped"
+    else
+        log_warn "wg-user did not exit within ${STOP_TIMEOUT}s; sending SIGKILL"
+        kill -KILL "$pid" 2>/dev/null || true
+        # Give the kernel a moment to reap it, then refuse to report success
+        # for a process that survived SIGKILL (e.g. uninterruptible sleep).
         i=0
-        while [ $i -lt 50 ] && kill -0 "$pid" 2>/dev/null; do
+        while [ "$i" -lt 10 ] && kill -0 "$pid" 2>/dev/null; do
             sleep 0.1
             i=$((i + 1))
         done
-        kill -0 "$pid" 2>/dev/null && kill -TERM "$pid" 2>/dev/null || true
-        rm -f "$WPPIDFILE"
-        log_info "wireproxy stopped"
-    else
-        rm -f "$WPPIDFILE"
-        log_info "wireproxy not running"
+        if kill -0 "$pid" 2>/dev/null; then
+            # Keep the pidfile: the process is still tracked, and the next stop
+            # retries instead of losing it.
+            log_err "wg-user (pid $pid) survived SIGKILL"
+            return 1
+        fi
+        log_info "wg-user killed"
     fi
-    # Stop the tunnel after wireproxy so the WG handshake errors don't pile up.
-    cmd_tunnel_stop
+    rm -f "$PIDFILE"
+    return 0
 }
 
 cmd_restart() {
@@ -235,55 +164,105 @@ cmd_restart() {
 }
 
 cmd_reload() {
-    if [ ! -f "$WPCONF" ]; then
-        log_err "no config at $WPCONF"
+    if [ ! -f "$CONF" ]; then
+        log_err "no config at $CONF"
         return 1
     fi
-    log_info "configtest $WPCONF"
-    if ! "$BINWP" -n -c "$WPCONF"; then
-        log_err "configtest FAILED; not reloading. See $WPLOG for details."
+    if [ ! -x "$BIN" ]; then
+        log_err "binary not installed: $BIN"
+        return 1
+    fi
+    log_info "configtest $CONF"
+    # configtest explains a bad file on stderr; its "Config OK" is noise here.
+    if ! "$BIN" configtest -c "$CONF" >/dev/null; then
+        log_err "configtest FAILED; not reloading. See $LOG for details."
         return 1
     fi
     log_info "config OK; restarting"
     cmd_restart
 }
 
+# ---------- reporting ----------
+
 cmd_status() {
-    rc=0
-    if is_running "$WPPIDFILE"; then
-        pid=$(cat "$WPPIDFILE")
-        log_info "wireproxy: running (pid $pid)"
-        [ -f "$WPLOG" ] && log_info "last log: $(tail -n1 "$WPLOG")"
-    else
-        log_info "wireproxy: stopped"
-        rc=1
+    # A stale or reused pidfile means the process is not ours; run/state is
+    # only meaningful while the pid it belongs to is alive and is ours.
+    if ! pid=$(running_pid); then
+        log_info "wg-user: stopped"
+        return 1
     fi
-    cmd_tunnel_status || rc=$?
-    return $rc
+
+    log_info "wg-user: running (pid $pid)"
+    if [ -f "$LOG" ]; then
+        log_info "last log: $(tail -n 1 "$LOG")"
+    fi
+
+    # run/state carries the pid that wrote it: another daemon's transport (or a
+    # file left by a dead one) must never be reported as this process's.
+    if [ "$(state_value pid)" != "$pid" ]; then
+        log_info "transport: unknown"
+        return 0
+    fi
+
+    detail=$(state_value transport_detail)
+    tstate=$(state_value transport_state)
+    if [ -z "$detail" ] && [ -z "$tstate" ]; then
+        log_info "transport: unknown"
+    elif [ -z "$detail" ] || [ -z "$tstate" ]; then
+        log_info "transport: ${detail:-unknown}${tstate:+ ($tstate)}"
+    else
+        log_info "transport: $detail ($tstate)"
+    fi
+    return 0
 }
 
 cmd_log() {
-    target="${1:-wireproxy}"
-    n="${2:-50}"
-    case "$target" in
-        wireproxy|wp) f="$WPLOG" ;;
-        tunnel|tn)     f="$TNLOG" ;;
-        *) log_err "log: unknown target '$target' (use 'wireproxy' or 'tunnel')"; return 1 ;;
+    [ "$#" -le 1 ] || { log_err "log: too many arguments (use 'log [N]')"; return 2; }
+    n="${1:-50}"
+    case "$n" in
+        ''|*[!0-9]*) log_err "log: invalid line count '$n'"; return 2 ;;
     esac
-    [ -f "$f" ] || { log_err "no log: $f"; return 1; }
-    tail -n "$n" "$f"
+    [ "$n" -gt 0 ] || { log_err "log: invalid line count '$n'"; return 2; }
+    [ -f "$LOG" ] || { log_err "no log: $LOG"; return 1; }
+    tail -n "$n" "$LOG"
 }
 
 cmd_save_config() {
-    src="$1"
-    [ -n "$src" ] && [ -f "$src" ] || { log_err "save-config: file not found: $src"; return 1; }
-    cp -f "$src" "$WPCONF"
-    log_info "saved config to $WPCONF"
-    cmd_reload
+    src="${1:-}"
+    [ -n "$src" ] && [ -f "$src" ] || { log_err "save-config: file not found: ${src:-<none>}"; return 1; }
+    if [ ! -x "$BIN" ]; then
+        log_err "binary not installed: $BIN"
+        return 1
+    fi
+    # Validate the staged file BEFORE it replaces a working config: a typo in
+    # the WebUI editor must never leave etc/wireproxy.conf unparseable, and
+    # configtest explains the problem on stderr. (The watcher re-runs
+    # configtest before its restart, so this is not a second gate, just an
+    # early one.)
+    log_info "configtest $src"
+    if ! "$BIN" configtest -c "$src" >/dev/null; then
+        log_err "configtest FAILED; $CONF left unchanged. See the message above."
+        return 1
+    fi
+    cp -f "$src" "$CONF"
+    # The config holds the private key; customize.sh seeds it 0600 and this is
+    # the one other place the script writes it.
+    chmod 0600 "$CONF" 2>/dev/null \
+        || log_warn "could not chmod 0600 $CONF"
+    log_info "saved config to $CONF"
+    # The restart belongs to the reload watcher (service.sh compares the
+    # file's content signature every 5s). Restarting here too would stop+start
+    # the daemon twice per save, and two concurrent restarts can leave a dead
+    # pid in run/wg-user.pid while the survivor holds the port.
+    log_info "the reload watcher applies it within ~5s"
 }
 
 cmd_version() {
-    grep '^version=' "$ROOT/module.prop" | cut -d= -f2
+    if [ ! -f "$ROOT/module.prop" ]; then
+        log_err "no module.prop at $ROOT"
+        return 1
+    fi
+    sed -n 's/^version=//p' "$ROOT/module.prop" | head -n 1
 }
 
 usage() {
@@ -295,19 +274,6 @@ usage() {
 
 # ---------- dispatcher ----------
 
-# Handle the "tunnel" sub-namespace explicitly so the dispatcher stays flat.
-if [ "${1:-}" = "tunnel" ]; then
-    shift
-    case "${1:-}" in
-        start)   cmd_tunnel_start ;;
-        stop)    cmd_tunnel_stop ;;
-        status)  cmd_tunnel_status ;;
-        restart) cmd_tunnel_stop; cmd_tunnel_start ;;
-        *)       log_err "tunnel: unknown subcommand: $1"; usage; exit 1 ;;
-    esac
-    exit $?
-fi
-
 case "${1:-}" in
     start)        cmd_start ;;
     stop)         cmd_stop ;;
@@ -318,5 +284,5 @@ case "${1:-}" in
     save-config)  shift; cmd_save_config "$@" ;;
     version)      cmd_version ;;
     ""|-h|--help|help) usage; exit 0 ;;
-    *) log_err "unknown subcommand: $1"; usage; exit 1 ;;
+    *) log_err "unknown subcommand: $1"; usage; exit 2 ;;
 esac

@@ -1,7 +1,7 @@
 name: Release
 
-# Tag push -> full build (Go + Rust cross-compiles + WebUI) -> GitHub Release
-# with wg-user-<version>.zip and SHA256SUMS attached.
+# Tag push -> full build (Go cross-compile for 4 arches + WebUI) -> GitHub
+# Release with wg-user-<version>.zip and SHA256SUMS attached.
 #
 # workflow_dispatch runs the same build and uploads the zip as a workflow
 # artifact, but does not create a release.
@@ -38,55 +38,28 @@ jobs:
             exit 1
           fi
 
-      # ---------------- wireproxy (Go) ----------------
       - uses: actions/setup-go@v7
         with:
-          go-version: stable
+          # Pinned to the 1.26 series (.tool-versions says 1.26.5), never
+          # `stable`, so a new Go major cannot land in a release unreviewed.
+          go-version: '1.26.x'
 
       - uses: actions/cache@v6
         with:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ hashFiles('scripts/build.sh') }}
+          key: go-${{ runner.os }}-${{ hashFiles('go.sum', 'scripts/build.sh') }}
           restore-keys: go-${{ runner.os }}-
 
-      - name: Build wireproxy for 4 arches
-        run: bash scripts/build.sh
+      - name: go vet + go test
+        run: make test
 
-      # ---------------- wstunnel (Rust) ----------------
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
-
-      - uses: nttld/setup-ndk@v1
-        id: ndk
-        with:
-          ndk-version: r26d
-          add-to-path: false
-
-      - uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: cargo-${{ runner.os }}-${{ hashFiles('scripts/cargo-cross.sh') }}
-          restore-keys: cargo-${{ runner.os }}-
-
-      - name: Build wstunnel for 4 arches
-        env:
-          NDK: ${{ steps.ndk.outputs.ndk-path }}
-          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
-        run: bash scripts/cargo-cross.sh
-
-      - name: Every arch produced both binaries
-        run: |
-          for a in arm64-v8a armeabi-v7a x86_64 x86; do
-            for b in wireproxy wstunnel; do
-              test -x "bin/$a/$b" || { echo "::error::missing bin/$a/$b"; exit 1; }
-            done
-          done
-          ls -lh bin/*/
+      # The "every arch produced a binary" assertion lives in make build
+      # (test/shell/build_test.sh) and is repeated hard by package-only's
+      # check-bins guard, so there is no separate loop here.
+      - name: Cross-compile wg-user for 4 arches
+        run: make build
 
       # ---------------- WebUI + package ----------------
       - uses: pnpm/action-setup@v6

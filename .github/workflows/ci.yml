@@ -1,7 +1,8 @@
 name: CI
 
-# Runs on every pull request and on pushes to main. Keep this fast: the
-# heavy Rust cross-compile only runs in the release workflow.
+# Runs on every pull request and on pushes to main. Everything is Go-only
+# now: one cross-compile per arch produces bin/<arch>/wg-user, and the
+# wstunnel interop gate runs against the pinned v11 server binary.
 on:
   pull_request:
   push:
@@ -22,13 +23,16 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: sh -n on every script, NDK wrappers executable
+      - name: sh -n on every script, CLI and installer tests
         run: make verify
 
       - name: No real configs are tracked
         run: |
-          if git ls-files --error-unmatch etc/wireproxy.conf etc/tunnel.conf 2>/dev/null; then
-            echo "::error::etc/wireproxy.conf and etc/tunnel.conf must never be tracked (they hold keys)"
+          leaked=$(git ls-files -- etc/wireproxy.conf 'etc/tunnel.conf*')
+          if [ -n "$leaked" ]; then
+            echo "::error::these files hold keys and must never be tracked:"
+            echo "$leaked"
+            echo "::error::only etc/wireproxy.conf.example belongs in git (etc/tunnel.conf* is git-ignored, including the .migrated copy customize.sh leaves on devices)"
             exit 1
           fi
           echo "ok: only *.example configs are tracked"
@@ -40,6 +44,11 @@ jobs:
           v=$(sed -n 's/^version=//p' module.prop)
           w=$(node -p "require('./webui/package.json').version")
           echo "module.prop=$v webui/package.json=$w"
+          if [ "$v" != "$w" ]; then
+            echo "::error::module.prop version ($v) != webui/package.json version ($w) — bump both together"
+            exit 1
+          fi
+          echo "ok: versions agree"
 
   webui:
     name: WebUI (tsc + build + smoke test)
@@ -87,35 +96,54 @@ jobs:
   build-go:
     name: wireproxy (4 arches)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # build.sh defaults to the China mirror; on GitHub use the canonical
+      # proxy. Job-level so `make test`, `make interop` and `make build` all
+      # resolve modules the same way.
+      GOPROXY: https://proxy.golang.org,direct
     steps:
       - uses: actions/checkout@v7
 
       - uses: actions/setup-go@v7
         with:
-          go-version: stable
+          # Pinned to the 1.26 series (.tool-versions says 1.26.5). Not
+          # `stable`: that would drift to a new major without a review.
+          go-version: '1.26.x'
 
       - uses: actions/cache@v6
         with:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ hashFiles('scripts/build.sh') }}
+          key: go-${{ runner.os }}-${{ hashFiles('go.sum', 'scripts/build.sh') }}
           restore-keys: go-${{ runner.os }}-
 
-      - name: Cross-compile wireproxy
-        env:
-          GOPROXY: https://proxy.golang.org,direct
-        run: bash scripts/build.sh
+      - name: go vet + go test
+        run: make test
 
-      - name: Every arch produced a binary
+      - name: Fetch the pinned wstunnel v11 interop server
         run: |
-          for a in arm64-v8a armeabi-v7a x86_64 x86; do
-            test -x "bin/$a/wireproxy" || { echo "::error::missing bin/$a/wireproxy"; exit 1; }
-          done
-          ls -lh bin/*/wireproxy
+          mkdir -p bin/interop
+          curl -fsSL -o /tmp/wstunnel.tar.gz \
+            https://github.com/erebe/wstunnel/releases/download/v11.0.0/wstunnel_11.0.0_linux_amd64.tar.gz
+          # Pin the tarball, not the extracted binary: the release asset is
+          # stable, the extracted file has no exec bit (chmod below).
+          echo '9708a99717b5a951453c2ff7c14c25d3418d02ca7fcb96fdb382a8f2083bab5e  /tmp/wstunnel.tar.gz' | sha256sum -c -
+          tar -xzf /tmp/wstunnel.tar.gz -C bin/interop wstunnel
+          chmod +x bin/interop/wstunnel
+          ls -lh bin/interop/wstunnel
+
+      - name: Interop tests against the real wstunnel v11 server
+        run: make interop
+
+      - name: Cross-compile wg-user for 4 arches
+        # make build's last step is test/shell/build_test.sh, which asserts all
+        # four bin/<arch>/wg-user exist and that the amd64 one runs.
+        run: make build
 
       - uses: actions/upload-artifact@v7
         with:
-          name: wireproxy-bin
-          path: bin/*/wireproxy
+          name: wg-user-bin
+          path: bin/*/wg-user
           retention-days: 7

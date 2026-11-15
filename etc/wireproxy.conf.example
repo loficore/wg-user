@@ -5,10 +5,11 @@
 # [Interface] and [Peer]; at least one of [Socks5], [HTTP], or [TCPClientTunnel]
 # must be present to actually accept traffic.
 #
-# All string values may reference environment variables: $MY_VAR.
-# Use $$ to escape a literal $ (e.g. for a password containing $).
+# Values are literal: nothing expands $VAR or $$, so a password containing $
+# is used exactly as written and needs no escaping.
 #
-# Most fields are case-insensitive. Section names are case-sensitive.
+# Section and key names are matched case-insensitively ([peer] == [Peer]);
+# this file uses the canonical spelling.
 # =============================================================================
 
 # === [Interface] — this client ===
@@ -28,10 +29,12 @@ DNS = 10.0.0.1
 [Peer]
 # Required. Base64-encoded public key of the remote peer.
 PublicKey = <base64>
-# Required. host:port of the remote WireGuard UDP listener.
-# If you enable wstunnel in etc/tunnel.conf, change this to 127.0.0.1:51820
-# (the local-udp from tunnel.conf) — wstunnel then forwards to the real
-# server over TLS/443.
+# Required. host:port used for the WireGuard UDP traffic:
+# - Mode = off (the default): the remote WireGuard server's UDP port.
+# - Mode = wstunnel: the address the wstunnel SERVER forwards to, as seen from
+#   the server (its own loopback WireGuard listener, normally
+#   127.0.0.1:51820). The client's local UDP socket no longer exists; the
+#   transport is in-process.
 Endpoint = wireguard.example.com:51820
 # Optional. Pre-shared key (extra layer of post-quantum-ready symmetric key).
 # PresharedKey =
@@ -40,6 +43,28 @@ PersistentKeepalive = 25
 # Optional but important. AllowedIPs is the allowlist of CIDRs the SOCKS5
 # clients can reach THROUGH this peer. To allow all: 0.0.0.0/0, ::/0
 AllowedIPs = 0.0.0.0/0
+
+# === [Transport] — optional wstunnel obfuscation ===
+# Without a [Transport] section (or with Mode = off) the WireGuard UDP packets
+# go straight to [Peer] Endpoint. Mode = wstunnel wraps them in WebSocket/TLS
+# to survive networks that block UDP; see docs/TUNNEL-SERVER.md. 0.3.0 reads
+# this section instead of the old etc/tunnel.conf, which the installer
+# migrates automatically.
+[Transport]
+# "off" (default) or "wstunnel".
+Mode = off
+# Required when Mode = wstunnel. wstunnel server URL; scheme ws or wss.
+# URL = wss://your-server.com:443
+# Optional. WebSocket upgrade path prefix. Default v1.
+# Path = v1
+# Optional. Seconds between WebSocket keepalive pings; 0 disables. Default 25.
+# Keepalive = 25
+# Optional. Basic auth for the upgrade request; send both or neither.
+# Username = myuser
+# Password = mypassword
+# Optional. true skips TLS certificate verification (self-signed servers);
+# false, the default, verifies the server certificate.
+# Insecure = false
 
 # === One or more of these inbound sections ===
 [Socks5]

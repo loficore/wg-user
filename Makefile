@@ -1,51 +1,64 @@
 # wg-user build orchestration
-# Use: make build / make build-go / make build-rust / make clean / make package / make verify
+# Use: make build / make test / make clean / make package / make verify
 
 SHELL := /bin/bash
 ROOT_DIR := $(shell pwd)
 SCRIPTS  := $(ROOT_DIR)/scripts
 BIN      := $(ROOT_DIR)/bin
 DIST     := $(ROOT_DIR)/dist
-VERSION  := $(shell grep '^version=' $(ROOT_DIR)/module.prop | cut -d= -f2)
+VERSION  := $(shell sed -n 's/^version=//p' $(ROOT_DIR)/module.prop)
 
 ARCHS := arm64-v8a armeabi-v7a x86_64 x86
-WPBINS := $(addprefix $(BIN)/,$(addsuffix /wireproxy,$(ARCHS)))
-TNBINS := $(addprefix $(BIN)/,$(addsuffix /wstunnel,$(ARCHS)))
+GOWBINS := $(addprefix $(BIN)/,$(addsuffix /wg-user,$(ARCHS)))
 WEBUI_DIR := $(ROOT_DIR)/webui
 WEBROOT := $(ROOT_DIR)/webroot
 
 # Files that make up the distributable module zip.
-# NOTE: etc/wireproxy.conf and etc/tunnel.conf are deliberately absent —
-# they hold real keys. customize.sh seeds them from the examples (or keeps
+# NOTE: etc/wireproxy.conf and etc/tunnel.conf* are deliberately absent —
+# they hold real keys. customize.sh seeds them from the example (or keeps
 # the copy already on the device).
-PKG_FILES := module.prop customize.sh uninstall.sh sepolicy.rule service.sh wg-user common/ etc/wireproxy.conf.example etc/tunnel.conf.example webroot/ bin/arm64-v8a bin/armeabi-v7a bin/x86_64 bin/x86 scripts/cargo-wrappers/ README.md LICENSE docs/INSTALL.md docs/CONFIG.md docs/TUNNEL-SERVER.md docs/CHANGELOG.md docs/ARCHITECTURE.md
+PKG_FILES := module.prop customize.sh uninstall.sh sepolicy.rule service.sh wg-user common/ etc/wireproxy.conf.example webroot/ bin/arm64-v8a bin/armeabi-v7a bin/x86_64 bin/x86 README.md LICENSE docs/INSTALL.md docs/CONFIG.md docs/TUNNEL-SERVER.md docs/CHANGELOG.md docs/ARCHITECTURE.md
 
-.PHONY: build build-go build-rust webui webui-clean clean package package-only verify help
+# Entries the archive must contain. PKG_FILES is hand-maintained and `zip -r`
+# exits 0 when a named entry is missing (it just leaves it out), so an omission
+# would ship silently; check-archive asserts the result. Paths are relative to
+# the archive root, exactly as zipinfo -1 prints them. The list is deliberately
+# runtime-only: docs/, LICENSE and sepolicy.rule are packaged but not asserted
+# (a missing doc degrades the package, a missing script/binary breaks it).
+PKG_REQUIRED := module.prop wg-user service.sh customize.sh uninstall.sh \
+	common/util.sh common/abi.sh webroot/app.js webroot/index.html \
+	etc/wireproxy.conf.example \
+	bin/arm64-v8a/wg-user bin/armeabi-v7a/wg-user \
+	bin/x86_64/wg-user bin/x86/wg-user
+
+.PHONY: build build-go test webui webui-clean clean check-bins check-archive package package-only verify interop help FORCE
 
 help:
-	@echo "make build      - cross-compile wireproxy (Go) + wstunnel (Rust)"
-	@echo "make build-go   - only wireproxy (faster, ~3 min)"
-	@echo "make build-rust - only wstunnel (~5 min; needs NDK + rustup targets)"
+	@echo "make build      - cross-compile the single wg-user binary for 4 arches"
+	@echo "make build-go   - same as build (kept for CI compatibility)"
+	@echo "make test       - go vet + go test"
 	@echo "make webui      - rebuild the Preact+Tailwind KSU WebUI (needs node)"
 	@echo "make clean      - remove build artifacts"
 	@echo "make package    - zip the module for distribution (after build)"
-	@echo "make verify     - run syntax/static checks and configtest"
+	@echo "make verify     - shell syntax checks (+ CLI/install tests when present)"
+	@echo "make interop    - run the tests against the real wstunnel v11 server (needs $(BIN)/interop/wstunnel)"
 
-build: build-go build-rust
+build: build-go
 
-build-go: $(WPBINS)
+build-go: $(GOWBINS)
+	@sh $(ROOT_DIR)/test/shell/build_test.sh
 
-build-rust: $(TNBINS)
+# One cross-compile per arch. build.sh loops over all four when ARCH is unset;
+# the pattern rule builds just the arch it was asked for.
+#
+# FORCE: Go does its own dependency tracking inside the build cache, and make
+# cannot see the package graph, so every build re-runs the cross-compile
+# instead of calling a stale bin/<arch>/wg-user up to date.
+$(BIN)/%/wg-user: FORCE $(SCRIPTS)/build.sh
+	ARCH=$* bash $(SCRIPTS)/build.sh
 
-$(BIN)/%/wireproxy:
-	GOPROXY=$${GOPROXY:-https://goproxy.cn,direct} \
-	WIREPROXY_VERSION=$${WIREPROXY_VERSION:-v1.1.3} \
-	    bash $(SCRIPTS)/build.sh
-
-$(BIN)/%/wstunnel:
-	ANDROID_NDK_HOME=$${ANDROID_NDK_HOME:-$$HOME/Android/Sdk/ndk/26.3.11579264} \
-	WSTUNNEL_VERSION=$${WSTUNNEL_VERSION:-v11.0.0} \
-	    bash $(SCRIPTS)/cargo-cross.sh
+test:
+	go vet ./... && go test ./...
 
 webui:
 	@echo "==> building Preact + TypeScript + Tailwind WebUI -> $(WEBROOT)..."
@@ -55,31 +68,97 @@ webui:
 webui-clean:
 	rm -f $(WEBROOT)/app.js $(WEBROOT)/index.html $(WEBROOT)/style.css
 
+# NOTE: this deliberately does not run webui-clean. webroot/app.js, index.html
+# and style.css are tracked in git and shipped in the module zip, and make build
+# does not regenerate them, so wiping them here would record three deletions of
+# files the module cannot do without. Rebuild the bundle explicitly with
+# `make webui` (or `make webui-clean` to drop it on purpose).
 clean:
-	rm -rf $(BIN)/*/wireproxy $(BIN)/*/wstunnel
-	rm -rf $(DIST)
-	$(MAKE) webui-clean
+	rm -rf $(BIN)/*/wg-user $(BIN)/interop $(DIST)
 
-package: build webui
+# zip exits 0 when a named entry is missing, it just leaves it out — so a
+# package run after `make clean` would "succeed" with empty bin/<arch>/ dirs.
+# Refuse to build an archive unless all four cross-compiles are present.
+check-bins:
+	@missing=""; \
+	for b in $(GOWBINS); do \
+	    if [ ! -f "$$b" ] || [ ! -x "$$b" ]; then missing="$$missing $$b"; fi; \
+	done; \
+	if [ -n "$$missing" ]; then \
+	    echo "ERROR: cannot package, missing wg-user binaries:$$missing"; \
+	    echo "       run 'make build' first (or 'make package', which builds)."; \
+	    exit 1; \
+	fi
+
+# Assert the archive just written has every required entry. Runs after the zip
+# step (zip exits 0 for a missing PKG_FILES entry). If only the tar fallback
+# exists (no `zip`, hence no archive tool at all) the check is reported, not
+# attempted. zipinfo is not implied by `zip`: Debian/Ubuntu package it in
+# `unzip`, so fall back to `unzip -Z1` and fail with an install hint rather than
+# a bare "command not found".
+check-archive:
+	@set -e; \
+	zip="$(DIST)/wg-user-$(VERSION).zip"; \
+	tarball="$(DIST)/wg-user-$(VERSION).tar.gz"; \
+	if [ ! -f "$$zip" ]; then \
+	    if [ -f "$$tarball" ]; then \
+	        echo "  archive check: SKIPPED ($$tarball; check assumes a zip)"; \
+	        exit 0; \
+	    fi; \
+	    echo "ERROR: no archive in $(DIST)"; \
+	    exit 1; \
+	fi; \
+	if command -v zipinfo >/dev/null 2>&1; then \
+	    listing=$$(zipinfo -1 "$$zip"); \
+	elif command -v unzip >/dev/null 2>&1; then \
+	    listing=$$(unzip -Z1 "$$zip"); \
+	else \
+	    echo "ERROR: cannot inspect $$zip: neither zipinfo nor unzip is installed."; \
+	    echo "       Install unzip (it provides zipinfo) or package on a host that has it."; \
+	    exit 1; \
+	fi; \
+	missing=""; \
+	for e in $(PKG_REQUIRED); do \
+	    printf '%s\n' "$$listing" | grep -Fqx "$$e" || missing="$$missing $$e"; \
+	done; \
+	if [ -n "$$missing" ]; then \
+	    echo "ERROR: $$zip is missing mandatory entries:"; \
+	    for e in $$missing; do echo "         $$e"; done; \
+	    echo "       Fix PKG_FILES in the Makefile and re-run 'make package'."; \
+	    rm -f "$$zip"; \
+	    exit 1; \
+	fi; \
+	echo "  archive check: all $(words $(PKG_REQUIRED)) required entries present in $$zip"
+
+package: build check-bins webui
 	@echo "==> packaging wg-user v$(VERSION)..."
 	@mkdir -p $(DIST)
+	@# Start from a clean archive: `zip -r` updates an existing one, so an entry
+	@# that left PKG_FILES would otherwise survive inside the new package.
+	@rm -f $(DIST)/wg-user-$(VERSION).zip $(DIST)/wg-user-$(VERSION).tar.gz
 	@cd $(ROOT_DIR) && zip -r $(DIST)/wg-user-$(VERSION).zip $(PKG_FILES) 2>/dev/null || \
 	  (echo "zip not found, trying tar:" && tar czf $(DIST)/wg-user-$(VERSION).tar.gz $(PKG_FILES))
+	@$(MAKE) --no-print-directory check-archive
 	@ls -lh $(DIST)
 
-# Same archive, but without re-running the slow cross-compiles. Use after
+# Same archive, but without re-running the cross-compiles. Use after
 # touching only webui/ or docs/.
-package-only: webui
+package-only: check-bins webui
 	@echo "==> packaging wg-user v$(VERSION) (no rebuild)..."
 	@mkdir -p $(DIST)
+	@rm -f $(DIST)/wg-user-$(VERSION).zip $(DIST)/wg-user-$(VERSION).tar.gz
 	@cd $(ROOT_DIR) && zip -r $(DIST)/wg-user-$(VERSION).zip $(PKG_FILES) 2>/dev/null || \
 	  (echo "zip not found, trying tar:" && tar czf $(DIST)/wg-user-$(VERSION).tar.gz $(PKG_FILES))
+	@$(MAKE) --no-print-directory check-archive
 	@ls -lh $(DIST)
 
+# No Go toolchain and no built binaries required: syntax-check every script
+# with the interpreter named in its shebang, then run the shell suites that
+# Tasks 11 and 12 add (skipped while they do not exist yet).
 verify:
 	@echo "==> syntax checks (interpreter from the shebang)..."
 	@ok=0; fail=0; \
-	for f in customize.sh uninstall.sh service.sh wg-user scripts/*.sh common/*.sh; do \
+	for f in customize.sh uninstall.sh service.sh wg-user scripts/*.sh common/*.sh test/shell/*.sh; do \
 	    [ -f "$$f" ] || continue; \
 	    interp=sh; \
 	    if head -n 1 "$$f" | grep -q bash; then interp=bash; fi; \
@@ -90,15 +169,33 @@ verify:
 	    fi; \
 	done; \
 	if [ $$fail -gt 0 ]; then echo "$$fail file(s) failed syntax"; exit 1; fi
-	@echo "==> wrapper executability check..."
-	@for f in scripts/cargo-wrappers/*; do \
-	    if [ ! -x "$$f" ]; then echo "  NOT exec: $$f"; exit 1; fi; \
-	done; \
-	echo "  ok: $$(ls scripts/cargo-wrappers/ | wc -l) wrappers"
-	@if [ -x $(BIN)/x86_64/wireproxy ]; then \
-	    echo "==> wireproxy -n configtest..."; \
-	    if [ -f etc/wireproxy.conf ]; then \
-	        $(BIN)/x86_64/wireproxy -n -c etc/wireproxy.conf \
-	            || echo "  (configtest failed; expected with PLACEHOLDER keys)"; \
-	    fi; \
+	@echo "==> shell tests..."
+	@for t in test/shell/cli_test.sh test/shell/install_test.sh; do \
+	    if [ -f "$$t" ]; then echo "  running $$t"; sh "$$t" || exit 1; fi; \
+	done
+
+# Interoperability tests against the official wstunnel v11 server. The binary is
+# scratch (bin/interop/ is git-ignored); fetch it with the commands printed when
+# it is missing. Pass WSTUNNEL_SERVER_BIN to use a different build.
+#
+# Fetch commands are inline (not a download target) because this is a manual,
+# local-only step. Note the asset name: v11.0.0 names its Linux x86_64 build
+# wstunnel_11.0.0_linux_amd64.tar.gz (the older wstunnel-v11.0.0-x86_64-... form
+# 404s), the tarball stores the binary without the exec bit (hence chmod), and
+# the checksum is the verified SHA-256 of that tarball.
+#
+# -count=1 is required: the test cache does not see the server binary (it is
+# exec'd, not read through the instrumented file APIs) and WSTUNNEL_SERVER_BIN
+# keeps the same path when the pinned server is swapped, so a cached PASS would
+# defeat exactly the drift check this target exists to be.
+interop:
+	@if [ ! -x "$${WSTUNNEL_SERVER_BIN:-$(BIN)/interop/wstunnel}" ]; then \
+	    echo "missing wstunnel v11.0.0 server binary ($${WSTUNNEL_SERVER_BIN:-$(BIN)/interop/wstunnel}); fetch it with:"; \
+	    echo "  mkdir -p $(BIN)/interop && curl -fsSL -o /tmp/wstunnel.tar.gz \\"; \
+	    echo "    https://github.com/erebe/wstunnel/releases/download/v11.0.0/wstunnel_11.0.0_linux_amd64.tar.gz"; \
+	    echo "  echo '9708a99717b5a951453c2ff7c14c25d3418d02ca7fcb96fdb382a8f2083bab5e  /tmp/wstunnel.tar.gz' | sha256sum -c -"; \
+	    echo "  tar -xzf /tmp/wstunnel.tar.gz -C $(BIN)/interop wstunnel && chmod +x $(BIN)/interop/wstunnel"; \
+	    exit 1; \
 	fi
+	@WSTUNNEL_SERVER_BIN=$${WSTUNNEL_SERVER_BIN:-$(BIN)/interop/wstunnel} \
+	    go test -tags interop ./internal/wstunnel -run Interop -v -count=1

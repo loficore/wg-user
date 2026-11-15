@@ -5,10 +5,11 @@
 # [Interface] and [Peer]; at least one of [Socks5], [HTTP], or [TCPClientTunnel]
 # must be present to actually accept traffic.
 #
-# All string values may reference environment variables: $MY_VAR.
-# Use $$ to escape a literal $ (e.g. for a password containing $).
+# Values are literal: nothing expands $VAR or $$, so a password containing $
+# is used exactly as written and needs no escaping.
 #
-# Most fields are case-insensitive. Section names are case-sensitive.
+# Section and key names are matched case-insensitively ([peer] == [Peer]);
+# this file uses the canonical spelling.
 # =============================================================================
 
 # === [Interface] — this client ===

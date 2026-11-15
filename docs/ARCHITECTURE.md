@@ -1,6 +1,7 @@
 # wg-user — Architecture & Design
 
-> **Status:** Approved design. Implementation follows `docs/superpowers/plans/2026-10-10-wg-user-module.md`.
+> **Status:** 0.3.0 design (single binary). The approved design document is
+> `docs/superpowers/specs/2026-11-15-wg-single-binary-design.md`.
 
 ## 1. Goal
 
@@ -11,11 +12,15 @@ Build a KSU module that:
 3. **Creates no TUN device** — pure userspace, no kernel WireGuard needed.
 4. Is **multi-root compatible** (KernelSU, Magisk, APatch).
 5. Supports **multi-architecture** (arm64-v8a, armeabi-v7a, x86_64, x86).
-6. Supports **hot config reload** (file watcher + graceful restart).
+6. Supports **hot config reload** (file watcher + restart).
 7. Provides a **KSU WebUI** for status, control, and config editing.
-8. **Optional obfuscation transport** for the WG UDP path: wraps WG traffic in
-   WebSocket-over-TLS (default port 443) to defeat carrier UDP throttling /
-   blocking common on mobile networks in China.
+8. Ships an **optional obfuscation transport** for the WG UDP path: WG
+   traffic wrapped in WebSocket-over-TLS (default port 443) to defeat
+   carrier UDP throttling / blocking common on mobile networks in China.
+
+0.3.0 adds one structural constraint to those goals: **everything is one
+Go binary and one process**. SOCKS5/HTTP (wireproxy, linked as a library),
+WireGuard, and the WebSocket transport all live in `bin/<arch>/wg-user`.
 
 ## 2. Why a SOCKS5/HTTP proxy, not a TUN device
 
@@ -30,9 +35,9 @@ Two paths were considered:
 | TUN + wg0 + redsocks | High perf, kernel WG | Needs TUN, may collide with FlClash tun0, requires extra SELinux rules | ✗ |
 | SOCKS5 from in-process wireguard-go + gvisor netstack | No TUN, no kernel WG dependency, no FlClash collision | Slightly lower perf; no SOCKS5 UDP (yet) | ✓ |
 
-**Chosen approach:** the second. We use **`wireproxy`** (Go, MIT-style) which
-embeds `wireguard-go` and `gvisor/netstack` in one binary, exposes a fake TUN
-in-process, and speaks SOCKS5/HTTP to local clients.
+**Chosen approach:** the second. We use **`wireproxy` v1.1.3** (ISC) as a
+Go library: it embeds `wireguard-go` and `gvisor/netstack`, exposes a fake
+TUN in-process, and speaks SOCKS5/HTTP to local clients.
 
 ## 3. Data flow
 
@@ -54,30 +59,28 @@ in-process, and speaks SOCKS5/HTTP to local clients.
                                   ▼
                  ┌─────────────────────────────────────────┐
                  │  127.0.0.1:1080 (SOCKS5)                 │
-                 │  ↑ wireproxy (root daemon, UID 0)        │
+                 │  wg-user: gvisor netstack + wireguard-go │
+                 │  one process, one binary (UID 0)         │
                  │  ↑ NOT in FlClash VPN allowed-UIDs       │
                  └────────────────┬─────────────────────────┘
-                                  │ TCP, gvisor netstack
+                                  │ WireGuard UDP datagram
                                   ▼
                  ┌─────────────────────────────────────────┐
-                 │  in-process "fake TUN" (channel)         │
-                 │  in-process wireguard-go                 │
-                 │  encrypts with WG keys                   │
+                 │  conn.Bind selected by [Transport] Mode  │
+                 │                                          │
+                 │  off:      kernel UDP socket             │
+                 │            → [Peer] Endpoint             │
+                 │                                          │
+                 │  wstunnel: in-process client            │
+                 │            no local socket; each datagram│
+                 │            is one WS binary frame        │
                  └────────────────┬─────────────────────────┘
-                                  │ UDP to 127.0.0.1:51820   (or remote if no tunnel)
+                                  │ (Mode = wstunnel) TCP 443, TLS
                                   ▼
                  ┌─────────────────────────────────────────┐
-                 │  [OPTIONAL] wstunnel (root daemon)       │
-                 │  listens 127.0.0.1:51820, forwards via   │
-                 │  WebSocket-over-TLS to remote server     │
-                 │  on port 443 (indistinguishable from     │
-                 │  normal HTTPS to carrier DPI)            │
-                 └────────────────┬─────────────────────────┘
-                                  │ TCP 443 over public internet
-                                  ▼
-                 ┌─────────────────────────────────────────┐
-                 │  wstunnel server on VPS (your-server:443)│
-                 │  forwards to 127.0.0.1:51820 of VPS      │
+                 │  wstunnel server v11.0.0 on the VPS      │
+                 │  --websocket-mask-frame (required)       │
+                 │  forwards to its --restrict-to target    │
                  └────────────────┬─────────────────────────┘
                                   │ UDP
                                   ▼
@@ -90,35 +93,47 @@ in-process, and speaks SOCKS5/HTTP to local clients.
                           Intranet resource
 ```
 
-**Why FlClash and wireproxy don't interfere:**
+`Mode = off` (the default) stops at the kernel socket: WG datagrams go
+straight to `[Peer] Endpoint`, exactly like 0.2.0's wireproxy. `Mode =
+wstunnel` replaces that socket with an in-process WebSocket connection.
+
+**Why FlClash and wg-user don't interfere:**
 
 - FlClash's VpnService installs UID-scoped routing rules. UID 0 (root daemon) is
   not in any application's allowed-UID set, so FlClash's tun0 does NOT see
-  wireproxy's outbound UDP packets.
+  wg-user's outbound UDP or TCP.
 - FlClash dials `127.0.0.1:1080`. The SOCKS5 connection is local; it never hits
   FlClash's TUN. From FlClash's perspective, this is a regular local socket.
-- wireproxy creates no TUN, so the kernel sees only its outbound UDP socket to
-  the WG peer. Routing is by the kernel's main table → physical interface.
-- wstunnel is a separate process. Its outbound TCP is on port 443; even if
-  FlClash's VpnService captured UID 0, TCP 443 is normally DIRECT in FlClash's
-  default rules (and the user can add an explicit rule for it).
+- wg-user creates no TUN, so in `off` mode the kernel sees only its outbound UDP
+  socket to the WG peer. Routing is by the kernel's main table → physical
+  interface.
+- In `wstunnel` mode the only socket is an outbound TCP connection on port 443;
+  even if FlClash's VpnService captured UID 0, TCP 443 is normally DIRECT in
+  FlClash's default rules (and the user can add an explicit rule for it).
 
 ## 4. Components
 
 | Component | File(s) | Role |
 |---|---|---|
 | Module metadata | `module.prop`, `customize.sh`, `sepolicy.rule` | KSU / Magisk / APatch installation hooks |
-| Autostart | `service.sh` | Invoked at `late_start`; starts wstunnel (if enabled) then wireproxy; runs hot-reload watcher |
-| Control CLI | `wg-user` (POSIX sh) | start / stop / restart / reload / status / log + `tunnel` subnamespace |
-| Shared shell lib | `common/util.sh`, `common/abi.sh` | Logging, path resolution, env detection, arch detection |
-| WireGuard client | `bin/wireproxy` (multi-arch, ~9 MB) | In-process wireguard-go + gvisor netstack + SOCKS5 server |
-| Obfuscation transport | `bin/wstunnel` (multi-arch, ~11 MB) | Optional WebSocket-over-TLS wrapper for the WG UDP path |
-| WireGuard config | `etc/wireproxy.conf`, `etc/wireproxy.conf.example` | WG keys, peer, SOCKS5 bind |
-| Tunnel config | `etc/tunnel.conf`, `etc/tunnel.conf.example` | `mode = off \| wstunnel` + remote URL, auth |
-| Hot reload | watcher in `service.sh` | Polls `etc/wireproxy.conf` AND `etc/tunnel.conf` mtime; restarts on change |
-| WebUI | `webroot/index.html`, `app.js`, `style.css` | Status / control / log / config editor; tunnel card |
-| Build (Go) | `Makefile`, `scripts/build.sh` | Cross-compile wireproxy for 4 architectures (Go, trivial) |
-| Build (Rust) | `scripts/cargo-cross.sh` | Cross-compile wstunnel for 4 architectures (Rust + NDK clang wrappers) |
+| Autostart | `service.sh` | Invoked at `late_start`; starts the daemon, then the reload watcher |
+| Control CLI | `wg-user` (POSIX sh) | start / stop / restart / reload / status / log / save-config / version |
+| Shared shell lib | `common/util.sh`, `common/abi.sh` | Logging, ABI detection, `select_binary` (each script resolves its own path inline) |
+| Daemon | `bin/wg-user` (~9 MB per arch) | WireGuard + gvisor netstack + SOCKS5/HTTP + the transport, in one process |
+| Config | `etc/wireproxy.conf`, `etc/wireproxy.conf.example` | WG keys, peer, inbounds, `[Transport]` |
+| Hot reload | watcher written by `service.sh` | Polls `etc/wireproxy.conf` mtime; restarts on change |
+| WebUI | `webroot/index.html`, `app.js`, `style.css` | Status / control / log / config editor |
+| Build | `Makefile`, `scripts/build.sh` | Cross-compile `wg-user` for 4 architectures |
+
+Go packages (`cmd/wg-user`, `internal/…`):
+
+| Package | Role |
+|---|---|
+| `internal/config` | Reads `etc/wireproxy.conf`: `wireproxy.ParseConfig` for the sections it owns, plus the `[Transport]` section parsed here |
+| `internal/wstunnel` | UDP-over-WebSocket client (dial, JWT, reconnect, keepalive) |
+| `internal/wgbind` | `conn.Bind` implementation: one `Send` = one WS frame, no local socket |
+| `internal/device` | netstack TUN + wireguard-go device + `wireproxy.VirtualTun` (port of upstream `StartWireguard`, with the bind injected) |
+| `internal/state` | Atomic `run/state` writer/reader |
 
 ## 5. Multi-root compatibility
 
@@ -128,108 +143,212 @@ in-process, and speaks SOCKS5/HTTP to local clients.
 | Magisk | `$MAGISK_VER` non-empty | `service.sh` is run by Magisk at `service.d` | `$MODDIR` |
 | APatch | `$APATCH` non-empty | `service.sh` is run by APatch | `$MODPATH` |
 
-All three root solutions use the same path: `/data/adb/modules/wg-user/`. The
-module's runtime code resolves its own directory from `${0%/*}` to be robust
-against env-var differences.
+All three root solutions use the same path: `/data/adb/modules/wg-user/`. Each
+shipped script resolves its own directory from `$0` with `dirname` (`wg-user`,
+`service.sh`, `uninstall.sh`). `service.sh` falls back to the fixed module path
+when `$0` is relative, `uninstall.sh` to `$MODPATH` and then the current
+directory (`$MODDIR` is its own near-empty variable, not a root-manager one),
+and `customize.sh` prefers `$MODPATH` because the installer sources it.
 
-`customize.sh` is KSU-specific (runs at install time, can read device ABI
-and copy the right binary). `install.sh` is Magisk-specific (same purpose, but
-called by `module_install` from the Magisk framework). Both delegate to
-`common/abi.sh::select_wireproxy_binary` so the logic lives in one place.
+`customize.sh` is the only install-time hook (KernelSU / Magisk "modern" path
+and APatch). It calls `common/abi.sh::select_binary` to copy
+`bin/<arch>/wg-user` to `bin/wg-user` for the device's ABI, restores
+executable bits (the installer extracts everything as 0644), seeds
+`etc/wireproxy.conf`, and runs the `tunnel.conf` migration described in §7.4.
+Without `bin/wg-user` the install aborts: there is no second binary to fall
+back to.
 
-## 6. Hot reload design
+## 6. Runtime model: one daemon, one supervisor loop
 
-wireproxy does not implement SIGHUP-based config reload (it accepts only
-SIGINT/SIGQUIT for graceful shutdown). To get hot reload, we wrap the daemon
-with a small watcher that:
+`bin/wg-user run -c etc/wireproxy.conf` (started by `wg-user start`) is the
+only long-lived process. Its shape:
 
-1. Records the mtime of `etc/wireproxy.conf` and `etc/tunnel.conf` on startup.
-2. Every 5 seconds (configurable), polls both files' mtime.
-3. If either changed, runs `wireproxy -n -c <config>` to validate the new
-   wireproxy config, and (if the tunnel config changed) also configtest the
-   tunnel by re-parsing `etc/tunnel.conf`.
-4. On configtest pass, sends SIGINT (graceful) to the current wstunnel (if
-   running) and wireproxy; waits for exit; re-execs `wg-user start` which
-   restarts them in the right order (wstunnel first, then wireproxy).
+1. **Signals.** `SIGINT`/`SIGTERM` cancel the root context.
+2. **Config.** `config.Load` parses `etc/wireproxy.conf` and validates
+   `[Transport]` before anything is brought up. A bad file exits 2.
+3. **Transport selection.** `off` → `conn.NewDefaultBind()`; `wstunnel` →
+   one `wstunnel.Client` plus `wgbind.New(client)`. The bind is fixed at
+   device construction, so a mode change needs a restart — which is what the
+   watcher does.
+4. **Device.** `device.Create` builds the netstack TUN, the wireguard-go
+   device and `wireproxy.VirtualTun`, then calls `dev.Up()`.
+5. **Inbounds.** `cfg.WireProxy.Routines` (SOCKS5, HTTP, …) are spawned as
+   goroutines, one per configured inbound.
+6. **Transport supervisor.** In `wstunnel` mode `client.Run` loops:
+   `connecting` → dial (10 s timeout) → `connected` → wait for the connection
+   to end or a keepalive tick → back off → retry. Backoff starts at 500 ms,
+   doubles, caps at 30 s, with ±20% jitter. A TLS certificate error is
+   **permanent**: no retry, the process logs it and exits 1.
+7. **State poller.** Once a second, `client.State()` is compared with the
+   last written value; `run/state` is rewritten only on a change.
+8. **Shutdown.** After the context ends (or the supervisor fails):
+   `Dev.Close()` → stop the supervisor → `client.Close()` → wait for `Run`
+   → close the poller → remove `run/state` → exit 0 (or 1 on a transport
+   error). The order matters: the device's receive routines must stop before
+   the transport they read from disappears.
 
-The watcher runs as a background POSIX shell loop inside `service.sh`. It is
-killed on `wg-user stop` to ensure clean shutdown.
+Goroutines in steady state: one per inbound routine, wireguard-go's own
+device routines, the transport supervisor + its reader, and the state poller.
+There is no second process, no local UDP listener, and no start-order
+dependency between components.
 
-Reload ordering is critical: **wstunnel must be up before wireproxy starts**,
-because wireproxy's WG endpoint may point at wstunnel's local UDP listener.
-`service.sh` enforces this by starting wstunnel first, waiting for its
-listener to bind (sleep 0.3 + retry connect), then starting wireproxy.
+Exit codes: `0` clean, `1` runtime/transport error, `2` usage or config
+error.
 
-## 7. Obfuscation transport (optional)
+The shell CLI keeps the process boundary thin:
 
-Mobile carriers (especially in CN) commonly throttle or block UDP traffic on
-mobile networks, which destroys WireGuard's default UDP transport. To fix this,
-the module ships an **optional** obfuscation layer: **wstunnel** (Rust,
-github.com/erebe/wstunnel, v11.0.0+).
-
-### How it integrates
-
-The user edits `etc/wireproxy.conf` so the WG endpoint is **local**:
-
-```ini
-[Peer]
-Endpoint = 127.0.0.1:51820      # was: 1.2.3.4:51820 (the real server)
-```
-
-And enables the tunnel in `etc/tunnel.conf`:
-
-```ini
-mode = wstunnel
-
-[wstunnel]
-local-udp = 127.0.0.1:51820
-remote    = wss://your-server.com:443
-# auth = user:password            # optional basic auth
-```
-
-At startup, `service.sh`:
-
-1. Reads `etc/tunnel.conf`. If `mode = off`, skips the wstunnel step entirely.
-2. Otherwise, runs `bin/wstunnel client ...` which:
-   - Listens on UDP `local-udp` (127.0.0.1:51820)
-   - Forwards every packet through a WebSocket-over-TLS tunnel to `remote`
-   - On the server, `wstunnel server` accepts the WSS, forwards to its local
-     UDP 51820 (where the real WireGuard daemon listens)
-3. After wstunnel is listening, starts `bin/wireproxy`, whose WG handshake
-   now flows: `wireguard-go` → UDP 127.0.0.1:51820 → wstunnel → WSS → server
-   → wg daemon.
-
-### Why wstunnel
-
-- **HTTPS-on-443 indistinguishable from real web traffic** to carrier DPI
-- **Single binary, both client and server** (one tool on the VPS too)
-- **Small** (11 MB stripped per arch, vs 50 MB for gost) — important for the
-  KSU module download
-- **Active development** (v11.x in 2026); v6.0 was the last Go release and is
-  far too old to use
-- The cross-compile cost (Rust + NDK clang wrapper) is one-time, baked into
-  `scripts/cargo-cross.sh`; users do not interact with it
-
-### Why not other tools
-
-| Tool | Why not |
+| Subcommand | Behaviour |
 |---|---|
-| `udp2raw` | Requires raw socket + iptables on the server; "fake TCP" can be detected by advanced DPI |
-| `gost` (Go) | Same Go toolchain simplicity, but 4.5× larger binary (200 MB zip vs 45 MB) |
-| `sing-box` | More general-purpose; would replace wireproxy entirely — bigger refactor |
-| Native WG obfuscation | Not available; would require patching wg-go |
+| `start` | `nohup bin/wg-user run -c etc/wireproxy.conf > log/wg-user.log 2>&1 &`, writes `run/wg-user.pid` (temp + rename), sets `oom_score_adj=-1000`, re-checks liveness after 1 s |
+| `stop` | SIGTERM, poll up to 20 s, then SIGKILL; refuses to signal a pid whose `/proc/<pid>/cmdline` is not this module's daemon |
+| `restart` | stop + start |
+| `reload` | `bin/wg-user configtest -c etc/wireproxy.conf`; restart only if it exits 0 |
+| `status` | pid + `transport: <detail> (<state>)`; `run/state` is only trusted when its `pid` matches the live pid |
+| `log [N]` | `tail -n N log/wg-user.log` (default 50) |
+| `save-config <path>` | copy to `etc/wireproxy.conf` (0600), then reload |
+| `version` | `version=` from `module.prop` |
 
-### Server setup (out of module scope)
+## 7. Transport layer (in-process)
 
-Documented in `docs/TUNNEL-SERVER.md`. One-command VPS setup:
+### 7.1 Protocol
 
-```bash
-# On the VPS (x86_64 Linux)
-wstunnel server wss://0.0.0.0:443 --restrict-to 127.0.0.1:51820
-# (and have a normal wireguard daemon listening on 127.0.0.1:51820)
+The client speaks the wstunnel v11 UDP-over-WebSocket protocol (`internal/wstunnel`),
+so the server side stays the unmodified official binary:
+
+- **Upgrade URL**: `{ws|wss}://<host>:<port>/<Path>/events`, `Path` default
+  `v1`. Any path in the configured `URL` is replaced, not appended to.
+- **Headers**: `Upgrade: websocket`, `Connection: upgrade`,
+  `Sec-WebSocket-Version: 13`, `Sec-WebSocket-Key`, and
+  `Sec-WebSocket-Protocol: v1, authorization.bearer.<jwt>`. With both
+  `Username` and `Password` set, `Authorization: Basic …` is added.
+- **JWT**: HS256, signed with a per-process random key. The server does not
+  verify the signature; it reads the claims: `id`, `p = {"Udp":{"timeout":null}}`,
+  `r` = `[Peer] Endpoint` host, `rp` = its port. Those two are what the
+  server is allowed to deliver to.
+- **Frames**: one WS binary frame is exactly one UDP datagram, in both
+  directions. Frames over 64 KiB are treated as a protocol error and the
+  connection is dropped.
+- **Keepalive**: `Ping` every `Keepalive` seconds (0 disables); incoming
+  `Ping` is answered with `Pong`; `Close` ends the connection.
+- **One connection at a time.** Reconnects produce a new server-side UDP
+  source port; WireGuard re-handshakes and the server roams to the new port,
+  so nothing server-side needs to change.
+
+### 7.2 The mask flag is a server requirement
+
+The client masks every frame, as RFC 6455 requires of a client (gorilla does
+this unconditionally). The official server only unmasks incoming frames when
+it was started with `--websocket-mask-frame`, which defaults to **off**.
+
+Without the flag: the TCP connection, the upgrade, the path and the JWT all
+succeed, and the server forwards the still-masked payload to UDP — every
+datagram arrives XORed with the 4-byte mask key. WireGuard never handshakes,
+and no error is logged anywhere. This is why the flag is called out in
+`docs/TUNNEL-SERVER.md`, in the CHANGELOG upgrade notes, and hard-coded in
+the interop test's server command.
+
+The flag only affects client→server frames; the server does not mask its own
+replies, so the Go client accepts them.
+
+### 7.3 State file contract
+
+`internal/state` owns `run/state`, a `key=value` file the shell CLI and the
+WebUI read. Written atomically (`run/state.tmp` → `chmod 0644` → `rename`),
+removed on clean exit, and rewritten only when the transport state changes:
+
+```
+pid=1234
+transport=wstunnel
+transport_state=connected
+transport_detail=wss://your-server.example.com:443
+updated=1763000000
 ```
 
-## 8. WebUI design
+| Key | Values |
+|---|---|
+| `pid` | the daemon's pid; readers require it |
+| `transport` | `off` or `wstunnel` (the `[Transport] Mode`) |
+| `transport_state` | `connected` \| `connecting` \| `reconnecting` \| `closed`; `off` only when `transport=off` |
+| `transport_detail` | free-form, normally the wstunnel URL or `udp`; never contains a newline |
+| `updated` | Unix seconds |
+
+`Write` rejects a `transport_detail` with a newline (it would forge an extra
+key). `Read` ignores unknown keys and lines without `=`, so the format can
+grow. `wg-user status` only trusts the file when `pid` matches the live
+daemon; a file left behind by a crash is ignored, and the daemon removes it
+on a normal exit. The WebUI renders `closed` and `off` as "not enabled".
+
+### 7.4 Installer migration
+
+`customize.sh` folds a 0.2.x `etc/tunnel.conf` into `etc/wireproxy.conf` once,
+on the first install/upgrade that finds one:
+
+| Old (`tunnel.conf`) | New (`wireproxy.conf`) |
+|---|---|
+| `mode = off` / `wstunnel` | `[Transport] Mode` |
+| `remote = wss://…` | `[Transport] URL` |
+| `username`, `password` | `Username`, `Password` |
+| `insecure` | `Insecure`, translated by 0.2.0's rule (below) |
+| `remote-udp` | `[Peer] Endpoint` (wstunnel mode only; default `127.0.0.1:51820`) |
+| `local-udp` | dropped — there is no local listener any more |
+
+Rules and failure modes:
+
+- **Skip if already migrated.** If `etc/wireproxy.conf` already contains a
+  `[Transport]` section, nothing is rewritten and the old file is still
+  parked.
+- **Unknown `mode`** (anything other than `off`/`wstunnel`) degrades to
+  `Mode = off` with a warning: 0.2.0 treated it as off, but 0.3.0's parser
+  rejects unknown modes, and rejecting the file would brick the daemon.
+- **Non-`ws://`/`wss://` URL** (for example `wts://`, WebTransport) degrades
+  to `Mode = off` with a warning. `Mode = wstunnel` without a URL does the
+  same. The warning says that in `off` mode `[Peer] Endpoint` must be the
+  real WireGuard server: the old value was the local listener.
+- **`insecure` translation.** 0.2.0 only verified the certificate when the
+  value started with `false`, `no` or `0`; every other value — and a missing
+  key — meant "do not verify". 0.3.0's `Insecure` defaults to `false`
+  (verify), so the migration maps `false*|no*|0*` → `Insecure = false` and
+  everything else, including an absent key → `Insecure = true`, with a
+  warning when the key was absent or empty. That preserves the old
+  behaviour instead of silently breaking a self-signed deployment.
+- **Trailing comments** are stripped from `mode`, `remote`, `remote-udp`
+  and `insecure` before use (the old reader kept the rest of the line).
+  Credentials are copied verbatim.
+- **The old file is kept**, never deleted: renamed to
+  `etc/tunnel.conf.migrated` (0600) when it lives in the new module
+  directory, or copied to `etc/tunnel.conf.migrated` when it belongs to the
+  currently installed module (that directory is replaced at the next boot).
+  This is the rollback path.
+- **A failed rewrite aborts the install** (exit 1) so the working 0.2.x
+  module stays in place. Continuing would leave `Mode = off` with the old
+  local `Endpoint`, i.e. WG traffic pointed back at the phone.
+
+A fresh install seeds `etc/wireproxy.conf` from the example (`Mode = off`)
+and never creates a `tunnel.conf`.
+
+## 8. Hot reload design
+
+wireproxy does not implement SIGHUP-based config reload. `service.sh`
+therefore writes a small watcher (`wg-user-reload`, `run/watcher.pid`) that:
+
+1. Records the mtime of `etc/wireproxy.conf` on startup.
+2. Every 5 seconds (override with `$WGU_RELOAD_INTERVAL`) compares it.
+3. On change, waits 1 s (debounce), then runs `wg-user reload`.
+4. `wg-user reload` runs `bin/wg-user configtest`; on failure the running
+   daemon is left alone and the error is logged. On success it restarts the
+   daemon.
+
+There is no reload path for `[Transport]` in particular: a transport change
+is an edit to `etc/wireproxy.conf`, and the restart rebuilds the client from
+the new file. Since the bind is chosen before the device comes up, this is
+the only correct sequence.
+
+`uninstall.sh` stops the watcher before the daemon (otherwise the watcher
+could restart the daemon against a directory that is about to be deleted),
+then stops the daemon through the CLI, then removes `run/wg-user.pid`,
+`run/watcher.pid` and `run/state`.
+
+## 9. WebUI design
 
 KSU exposes a WebView in which modules under `webroot/` are loaded. The page
 communicates with the daemon via the `ksu` global object. On KernelSU 3.x
@@ -248,14 +367,19 @@ communicates with the daemon via the `ksu` global object. On KernelSU 3.x
 
 UI sections:
 
-- **Status**: green/red dot plus a one-line summary, parsed from the text
-  of `wg-user status`.
+- **Status**: green/red dot plus a one-line summary parsed from the text
+  of `wg-user status`, including the transport line (`transport: wss://…
+  (connected)`).
 - **Controls**: Start / Stop / Restart / Reload buttons →
   `ksu.exec('/data/adb/modules/wg-user/wg-user <cmd>')`
-- **Logs**: tail the log file via `ksu.exec('wg-user log 50')`
+- **Logs**: tail the log file via
+  `ksu.exec('/data/adb/modules/wg-user/wg-user log 50')`
 - **Config editor**: `<textarea>` populated via
   `cat /data/adb/modules/wg-user/etc/wireproxy.conf`, saved via
-  `wg-user save-config`. On save, the CLI reloads the daemon.
+  `wg-user save-config <staged-file>`. On save, the CLI reloads the daemon.
+
+There is no separate tunnel card: the transport is part of the one config
+file and its live state is part of the status card.
 
 The WebUI is **optional** — the module works without it. The CLI (`wg-user`)
 is the source of truth for the API surface; the WebUI is a thin shim.
@@ -266,66 +390,73 @@ internationalised through `webui/src/i18n/` — `en.ts` is the source of
 truth for the key set, every other catalogue is typed against it, so a
 missing translation breaks the build.
 
-## 9. Build & distribution
+## 10. Build & distribution
 
-Two build pipelines, both triggered by `make build`:
+One pipeline, one toolchain:
 
-### Pipeline 1: wireproxy (Go)
+- `scripts/build.sh` cross-compiles this repository (`./cmd/wg-user`) with
+  `GOOS=linux GOARCH=<arm64|arm|amd64|386> CGO_ENABLED=0 go build -trimpath
+  -ldflags "-s -w -X main.version=$VERSION"` into `bin/<arch>/wg-user`
+  (~9 MB each). `test/shell/build_test.sh` asserts all four exist and that
+  the amd64 binary runs.
+- `make webui` rebuilds the Preact bundle into `webroot/` (pnpm install,
+  `tsc --noEmit`, esbuild, headless smoke test).
+- `make package` = `build` + `check-bins` + `webui`, then zips the module to
+  `dist/wg-user-<version>.zip` (~15 MB). `zip` missing falls back to
+  `tar.gz`.
+- `make package-only` re-zips without the cross-compiles.
+- `make clean` removes `bin/*/wg-user`, `bin/interop` and `dist/`. It does
+  **not** touch `webroot/`: the bundle is committed and shipped.
+- `make verify` syntax-checks every shell script with its shebang
+  interpreter, then runs the CLI and installer suites in `test/shell/`.
+- `make test` = `go vet ./... && go test ./...`.
+- `make interop` starts the pinned official `wstunnel` v11.0.0 server with
+  `--restrict-http-upgrade-path-prefix v1 --websocket-mask-frame` and round-trips
+  datagrams through it. The binary is scrubbed from `bin/interop/`; the
+  target prints the download + sha256 commands when it is missing.
 
-`scripts/build.sh` cross-compiles `github.com/windtf/wireproxy/cmd/wireproxy@v1.1.3`
-for the 4 architectures with `CGO_ENABLED=0 GOOS=linux`. Output: `bin/<arch>/wireproxy`
-(~9 MB each). Build time: ~3 min from scratch, < 30s incremental.
+Packaging carries `module.prop`, the shell scripts, `common/`, `webroot/`,
+the four `bin/<arch>` directories, and the docs. It carries only
+`etc/wireproxy.conf.example` — real configs hold the WireGuard private key.
 
-### Pipeline 2: wstunnel (Rust)
-
-`scripts/cargo-cross.sh` cross-compiles `github.com/erebe/wstunnel@v11.0.0`
-(`wstunnel-cli` crate) for the 4 Android targets using NDK 26.x clang wrappers.
-Required Rust targets: `aarch64-linux-android`, `armv7-linux-androideabi`,
-`x86_64-linux-android`, `i686-linux-android`. Output: `bin/<arch>/wstunnel`
-(~11 MB each). Build time: ~5 min from scratch, < 30s incremental.
-
-### Packaging
-
-- `make package` — zip the module into `dist/wg-user-<version>.zip` (or
-  `.tar.gz` if zip is unavailable) ready to flash via KSU/Magisk/APatch
-  module installer. Final size ~80-90 MB.
-- `make clean` — remove build artifacts.
-- `make verify` — run `sh -n` over all scripts, cross-compile sanity, and
-  `wireproxy -n` configtest on a sample config.
-
-## 9. Out of scope (YAGNI)
+## 11. Out of scope (YAGNI)
 
 - **SOCKS5 UDP ASSOCIATE**: wireproxy does not support it (TODO in upstream).
-  For UDP-based intranet traffic, the user must add a fallback. This is
-  acceptable for the user's stated "intranet" use case, which is mostly TCP.
-  Note: the obfuscation layer (wstunnel) wraps all UDP, so WG's UDP reaches
-  the server intact — the SOCKS5 UDP limitation is unrelated.
-- **Multiple simultaneous tunnels**: one `[Peer]` per config; we do not chain
-  or load-balance. Users who need this can use a SOCKS5→sing-box→mihomo stack.
+  For UDP-based intranet traffic, the user must add a fallback. Note: the
+  obfuscation layer (wstunnel) wraps WG's own UDP, so WG reaches the server
+  intact — the SOCKS5 UDP limitation is unrelated.
+- **A Go reimplementation of the wstunnel server**: the official binary
+  stays, pinned at v11.0.0.
+- **Multiple simultaneous transports / multiple `[Peer]` in wstunnel mode**:
+  one transport targets exactly one peer (enforced by `internal/config`).
+  Users who need more can use a SOCKS5→sing-box→mihomo stack.
 - **Kernel WireGuard mode**: deliberately avoided to keep the module
   dependency-free and prevent TUN conflicts.
 - **Automatic WG config sync from FlClash**: out of scope. The user manages
   the WG config independently; FlClash only sees the SOCKS5 endpoint.
-- **Supporting multiple obfuscation transports** (udp2raw, gost, etc.):
-  Only wstunnel is bundled. The config schema could be extended later to
-  allow pluggable transports (`mode = udp2raw` etc.), but YAGNI for now.
-- **TCP-over-TCP performance tuning**: wstunnel defaults are good enough.
-  Users with severe TCP-over-TCP issues can switch to wstunnel's QUIC mode
-  (`wss` → `wqs`).
+- **Other obfuscation transports** (udp2raw, gost, …): only the wstunnel
+  protocol is implemented.
+- **QUIC/WebTransport (`wqs://`)**: explicit non-goal for 0.3.0; the
+  installer degrades such an old URL to `Mode = off`.
+- **In-process config hot reload**: the mtime watcher + restart is enough.
+- **Shipping only arm architectures**: a size decision for later.
 
-## 10. Risks & mitigations
+## 12. Risks & mitigations
 
 | Risk | Likelihood | Mitigation |
 |---|---|---|
-| `landlock` syscall unavailable on Android kernel | Med | wireproxy uses `BestEffort() + IgnoreIfMissing()`; verified safe in code |
+| Server started without `--websocket-mask-frame` | Med | Documented as a hard requirement in `docs/TUNNEL-SERVER.md` and the CHANGELOG; the interop test always passes the flag; symptom ("handshake works, no traffic") is the first troubleshooting entry |
+| wstunnel server upgrades and changes the private handshake/frame format | Low | VPS version pinned at v11.0.0; CI interop gate against that exact binary (sha256-pinned); upgrade only after the gate passes |
+| The custom `conn.Bind` gets a wireguard-go semantic wrong | Low | Interop test with real datagrams; `Mode = off` as the control path; device-side acceptance checklist; `Close` is generation-scoped and recoverable |
+| Config migration writes an `Endpoint` that is the phone's local listener | Med | Migration rewrites `Endpoint` to the old `remote-udp` (default `127.0.0.1:51820`) in wstunnel mode, degrades invalid configs to `off` with a warning, and aborts the install if the rewrite fails |
+| Migration silently lowers TLS security | Med | `insecure` is translated by 0.2.0's prefix rule, not by boolean; an absent key becomes `Insecure = true` with a warning, and the CHANGELOG tells self-signed users how to keep or drop it |
+| Upstream wireproxy API changes | Low | `go.mod` pins v1.1.3; CI compiles and unit-tests every change |
+| Go 1.26 toolchain requirement | Low | `.tool-versions` pins 1.26.5; CI and release use `go-version: 1.26.x` |
+| Reconnect changes the server-side UDP source port | Low | WireGuard re-handshakes; the server roams to the new port; device acceptance step 3 covers it |
 | SOCKS5 UDP needed by some intranet app | Low | Document; recommend fallback to direct or L2TP/SS for UDP |
-| Wireproxy process killed by LMK | Low | `oom_score_adj = -1000` set in `wg-user start` |
-| Conf mtime changes during a reload | Low | Watcher debounces by 1s before re-reading |
-| Stale PID file after crash | Med | `wg-user start` overwrites PID; `start` always re-checks process exists |
-| WebUI exposes keys via cleartext | Med | Document that WebUI traffic is local; user should not expose port publicly |
-| Source download blocked in CN | Med | Use `GOPROXY=https://goproxy.cn,direct` (Go) and cargo's default registry (Rust) |
-| wstunnel starts before bind, wireproxy fails to dial | Med | `service.sh` waits for wstunnel UDP listener to be reachable before starting wireproxy (max 5 retries, 200ms apart) |
-| wstunnel's wss server unreachable on cellular (firewall) | Med | Documented; user can switch to QUIC (`wqs://`) for better fallback |
-| Rust build requires network (cargo registry, source download) | Med | First build downloads ~500 MB of crates; subsequent builds use cache. Document; users in restricted networks can pre-fetch or vendor. |
-| NDK clang version mismatch with rust target | Low | Pin to NDK 26.x in `scripts/cargo-cross.sh`; test on multiple NDK versions is in T8 |
-| wstunnel server TLS cert self-signed | Low | Document use of Let's Encrypt or `--restrict-to` mode for testing |
+| Daemon killed by LMK | Low | `oom_score_adj = -1000` set in `wg-user start` |
+| Conf mtime changes during a reload | Low | Watcher debounces by 1 s before re-reading |
+| Stale PID file after a crash | Med | `running_pid` validates `/proc/<pid>/cmdline` before signalling; `run/state` is only trusted when its pid matches |
+| WebUI exposes keys via cleartext | Med | Document that WebUI traffic is local; user should not expose the port publicly |
+| Source download blocked in CN | Med | `GOPROXY=https://goproxy.cn,direct` is the build default |
+| Single binary is still ~9 MB per arch | Med | Expected (~15 MB zip); the four-arch payload is the cost of the module supporting every ABI |

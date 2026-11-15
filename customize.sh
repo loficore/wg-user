@@ -196,9 +196,12 @@ park_tunnel_conf() {
 }
 
 # The [Transport] writer. Values arrive through the environment so a password
-# never shows up in `ps`. The section is emitted as-is: a value must never be
-# followed by a comment on the same line, because the INI parser keeps
-# everything after the value.
+# never shows up in `ps`. The section is emitted as-is, and no value is ever
+# followed by a comment on the same line: strip_comment() removes only "#",
+# while go-ini also strips ";" in an unquoted value, so keeping comments out is
+# belt-and-braces rather than a fix for a semantic difference. Credentials are
+# copied verbatim (never through strip_comment), so a '#' or ';' in a password
+# survives.
 MIGRATE_AWK='
 function emit_transport() {
     print ""

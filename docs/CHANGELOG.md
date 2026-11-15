@@ -2,6 +2,33 @@
 
 All notable changes to this project are documented here.
 
+## [0.3.2] — 2026-11-15
+
+### Fixed
+
+- **The daemon can no longer be frozen by Android.** Every process started
+  from an app inherits that app's cgroup (`/uid_<uid>/pid_<pid>`), and the
+  framework freezes such a cgroup when the app is backgrounded. The WebUI runs
+  inside the KernelSU app, so `start`/`restart` from it handed the daemon a
+  freezable cgroup: the process stayed alive with a valid pid file and a stale
+  `run/state`, its SOCKS listener stopped accepting connections, and the
+  transport stayed in `connecting` for as long as the app stayed backgrounded —
+  across any number of restarts, which made it look like an unstable tunnel.
+  The daemon now moves itself to the root cgroup at startup
+  (`device.EscapeAppCgroup`, before the config is even parsed) and logs the
+  move. The root cgroup is where a boot-started daemon already lives, so
+  nothing is granted that the daemon did not have; a process already outside an
+  app cgroup, or a system without a cgroup v2 hierarchy, is left alone.
+
+### Notes
+
+- `wg-user status` now warns when the running daemon is still inside an app
+  cgroup (an older install, or a binary started by hand), instead of reporting
+  a transport that will never change again.
+- `docs/TUNNEL-SERVER.md` gained the check (`awk -F: '$1 == "0" { print $3 }'
+  /proc/<pid>/cgroup`) and the one-shot fix (`echo <pid> >
+  /sys/fs/cgroup/cgroup.procs`) for a daemon that is already frozen.
+
 ## [0.3.1] — 2026-11-15
 
 ### Fixed

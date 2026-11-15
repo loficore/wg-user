@@ -151,6 +151,20 @@ func run(ctx context.Context, args []string, stderr io.Writer) int {
 		return exitUsage
 	}
 
+	// Android freezes a per-app cgroup (/uid_<uid>/pid_<pid>) when the app is
+	// backgrounded, and every process started from that app inherits it — the
+	// WebUI runs inside the KernelSU app, so "restart" from there used to hand
+	// the daemon a cgroup the framework could freeze. It then stayed alive,
+	// kept its pid file and its last state, and did nothing: the transport
+	// looked stuck in "connecting" and no restart helped. Leave the cgroup
+	// before anything else, because a frozen process cannot run this code
+	// later.
+	if esc, err := device.EscapeAppCgroup(); err != nil {
+		fmt.Fprintf(stderr, "wg-user: warning: %v; the daemon may be frozen while the app that started it is backgrounded\n", err)
+	} else if esc.Moved {
+		fmt.Fprintf(stderr, "wg-user: left Android app cgroup %s so the framework cannot freeze the daemon\n", esc.From)
+	}
+
 	cfg, err := config.Load(opts.configPath)
 	if err != nil {
 		fmt.Fprintf(stderr, "wg-user: %v\n", err)

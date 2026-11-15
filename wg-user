@@ -197,6 +197,18 @@ cmd_status() {
         log_info "last log: $(tail -n 1 "$LOG")"
     fi
 
+    # The daemon moves itself out of the app cgroup it was started from (the
+    # WebUI runs inside the KernelSU app, whose cgroup Android freezes when it
+    # is backgrounded). A process that is still inside one is alive but
+    # stopped: its transport will never change again. Say so instead of
+    # reporting a state file that only looks like a live transport.
+    _cg=$(awk -F: '$1 == "0" { print $3; exit }' "/proc/$pid/cgroup" 2>/dev/null)
+    case "$_cg" in
+        /uid_*)
+            log_warn "daemon is in the app cgroup $_cg; Android freezes it while that app is backgrounded and the transport stops — restart to move it out"
+            ;;
+    esac
+
     # run/state carries the pid that wrote it: another daemon's transport (or a
     # file left by a dead one) must never be reported as this process's.
     if [ "$(state_value pid)" != "$pid" ]; then

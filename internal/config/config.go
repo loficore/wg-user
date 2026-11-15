@@ -5,8 +5,10 @@
 package config
 
 import (
+	"context"
 	"fmt"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 
@@ -30,6 +32,10 @@ const (
 	defaultPath = "v1"
 	// defaultKeepalive is the WS ping interval used when Keepalive is not set.
 	defaultKeepalive = 25 * time.Second
+	// endpointResolveTimeout bounds the whole [Peer] Endpoint resolution during
+	// Load, so a blackholed nameserver cannot hang the daemon (or configtest)
+	// indefinitely. The resolver bounds each attempt more tightly.
+	endpointResolveTimeout = 10 * time.Second
 )
 
 // Transport is the parsed [Transport] section.
@@ -80,9 +86,60 @@ func load(path string) (*Config, error) {
 
 	// wireproxy only looks up the section names it knows, so it ignores
 	// [Transport] and the same file stays readable by 0.2.0 binaries.
-	wp, err := wireproxy.ParseConfig(path)
+	//
+	// wireproxy.ParseConfig resolves [Peer] Endpoint itself with Go's resolver,
+	// which has no nameserver on Android, so a hostname fails before our code
+	// can help. Resolve the names here and, only when one needed it, hand
+	// wireproxy a temporary copy whose endpoints are numeric. The common case —
+	// every endpoint already an IP — parses the original file exactly as before.
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
+	}
+	// data and resolved are in-memory copies of the config and therefore
+	// contain the private key. Go cannot wipe them (strings are immutable and
+	// the slices are short-lived), which is an accepted limitation; the copy
+	// that reaches disk is the temporary file below, mode 0600 and removed
+	// before this function returns.
+	//
+	// Bounded so a blackholed nameserver cannot hang daemon start; the resolver
+	// bounds each attempt more tightly itself.
+	ctx, cancel := context.WithTimeout(context.Background(), endpointResolveTimeout)
+	defer cancel()
+	resolved, rewrote, err := rewritePeerEndpoints(ctx, data)
+	if err != nil {
+		return nil, err
+	}
+
+	parsePath := path
+	if rewrote {
+		parsePath, err = writeTempConfig(path, resolved)
+		if err != nil {
+			return nil, err
+		}
+		// The file holds the private key: a panic below must not leave it
+		// behind. The explicit removal after parsing still runs so a failure
+		// can be reported; removing twice is harmless.
+		defer func() { _ = os.Remove(parsePath) }()
+	}
+
+	wp, parseErr := wireproxy.ParseConfig(parsePath)
+	// The temporary file holds the private key: it must not survive this
+	// function, including when parsing failed. Report a removal failure rather
+	// than leaving a key-bearing file behind silently.
+	if parsePath != path {
+		if rmErr := os.Remove(parsePath); rmErr != nil {
+			if parseErr != nil {
+				return nil, fmt.Errorf("%w (could not remove temporary config %s: %v)", parseErr, parsePath, rmErr)
+			}
+			return nil, fmt.Errorf("remove temporary config %s: %w", parsePath, rmErr)
+		}
+	}
+	if parseErr != nil {
+		// Load prefixes this with the original path. The temporary name is
+		// deliberately absent: it no longer exists, so naming it would not be
+		// actionable.
+		return nil, parseErr
 	}
 
 	transport, err := parseTransport(file.Section(transportSection), wp)

@@ -135,8 +135,10 @@ package: build check-bins webui
 	@mkdir -p $(DIST)
 	@# Start from a clean archive: `zip -r` updates an existing one, so an entry
 	@# that left PKG_FILES would otherwise survive inside the new package.
+	@# -9 is worth it here: four static ~9 MB binaries dominate the archive and a
+	@# one-off build can afford the extra deflate level (~100 KB smaller).
 	@rm -f $(DIST)/wg-user-$(VERSION).zip $(DIST)/wg-user-$(VERSION).tar.gz
-	@cd $(ROOT_DIR) && zip -r $(DIST)/wg-user-$(VERSION).zip $(PKG_FILES) 2>/dev/null || \
+	@cd $(ROOT_DIR) && zip -9 -r $(DIST)/wg-user-$(VERSION).zip $(PKG_FILES) 2>/dev/null || \
 	  (echo "zip not found, trying tar:" && tar czf $(DIST)/wg-user-$(VERSION).tar.gz $(PKG_FILES))
 	@$(MAKE) --no-print-directory check-archive
 	@ls -lh $(DIST)
@@ -147,7 +149,7 @@ package-only: check-bins webui
 	@echo "==> packaging wg-user v$(VERSION) (no rebuild)..."
 	@mkdir -p $(DIST)
 	@rm -f $(DIST)/wg-user-$(VERSION).zip $(DIST)/wg-user-$(VERSION).tar.gz
-	@cd $(ROOT_DIR) && zip -r $(DIST)/wg-user-$(VERSION).zip $(PKG_FILES) 2>/dev/null || \
+	@cd $(ROOT_DIR) && zip -9 -r $(DIST)/wg-user-$(VERSION).zip $(PKG_FILES) 2>/dev/null || \
 	  (echo "zip not found, trying tar:" && tar czf $(DIST)/wg-user-$(VERSION).tar.gz $(PKG_FILES))
 	@$(MAKE) --no-print-directory check-archive
 	@ls -lh $(DIST)

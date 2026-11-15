@@ -513,6 +513,11 @@ func (c *Client) dialOnce(ctx context.Context) error {
 	dialer := websocket.Dialer{
 		// Insecure is the user's explicit choice for self-signed servers.
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: c.cfg.Insecure}, //nolint:gosec
+		// Resolve the URL host ourselves and dial the IP: on Android the Go
+		// resolver has no nameserver, so gorilla's default dialling by name
+		// cannot work for a hostname. TLS SNI and the Host header still use the
+		// URL's name, because only the TCP destination is substituted.
+		NetDialContext: dialResolved,
 	}
 
 	conn, _, err := dialer.DialContext(ctx, endpoint, header)

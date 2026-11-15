@@ -56,6 +56,15 @@ What the address *means* depends on `[Transport] Mode`:
 | `off` | the WireGuard server's UDP address — datagrams are sent there from the phone | the kernel (`conn.NewDefaultBind`) |
 | `wstunnel` | the address the **server** delivers datagrams to, inside its `--restrict-to` set — normally `127.0.0.1:51820` (the server's own WireGuard listener) | the in-process transport (JWT `r`/`rp`) |
 
+Hostnames in `Endpoint` and in the `[Transport] URL` are resolved by the module
+itself, not by libc: Go's resolver is tried first, then
+`ping -c 1 -W 2 <host>` (Android ships no `/etc/resolv.conf`, so the pure Go
+resolver has no nameserver to ask). Successful answers are cached for five
+minutes. A failure is a config error naming the peer and host. **A numeric IP
+is still the most robust choice**: if DNS on the phone is unreliable, put the
+IP in the URL — TLS SNI and the `Host` header still use the name, because only
+the dialled address is substituted — and keep the hostname on the certificate.
+
 In other words: with `off` you write your server's public address; with
 `wstunnel` you write what *the server* should reach, and the public address
 goes into `[Transport] URL` instead. Pointing `Endpoint` at

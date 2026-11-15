@@ -2,6 +2,39 @@
 
 All notable changes to this project are documented here.
 
+## [0.3.1] — 2026-11-15
+
+### Fixed
+
+- **Hostnames work on Android again.** The 0.3.0 client is a static
+  `CGO_ENABLED=0` Go binary, so its hostname lookups use Go's pure resolver.
+  Android 10+ has no `/etc/resolv.conf` and leaves `net.dns1…4` empty, so the
+  resolver fell back to `[::1]:53` and **every hostname lookup failed**. A
+  `[Transport] URL` such as `wss://frp-pen.com:57968` left the transport in
+  `reconnecting` forever, and `[Peer] Endpoint = vpn.example.com:51820` made
+  `wg-user configtest` exit 2 with
+  `lookup … on [::1]:53: read udp …: connection refused`. The same configs
+  with a numeric IP always worked, which is why 0.2.0 (local libc
+  `getaddrinfo`) was unaffected.
+
+  Hostnames are now resolved by `internal/resolve`: the Go resolver first, then
+  a `/system/bin/ping -c 1 -W 2 <host>` fallback that parses the address out of
+  `PING <host> (<addr>)` and ignores ping's exit status (ICMP is often
+  blocked). Successful answers are cached for 5 minutes. This covers both the
+  WebSocket dial (the TCP connection goes to the resolved IP while TLS SNI and
+  the `Host` header keep the name) and `[Peer] Endpoint`, which is now resolved
+  before wireproxy parses the config.
+
+### Notes
+
+- **A numeric IP is still the most robust choice** in `[Transport] URL` and
+  `[Peer] Endpoint`. If DNS on the phone is unreliable, put the IP in the URL
+  and keep the hostname in the certificate — SNI is unaffected because only the
+  dialled address is substituted.
+- No breaking changes: existing configs, keys, scripts and the CLI are
+  unchanged. A hostname that cannot be resolved now fails the config load with
+  an error that names the peer and host, instead of a silent reconnect loop.
+
 ## [0.3.0] — 2026-11-15
 
 The single-binary release: the wstunnel client is now Go code in this

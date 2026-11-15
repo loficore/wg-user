@@ -321,9 +321,20 @@ So do not wait for a message that will never be printed: use the checks below.
      (bad path, blocked upgrade, refused forward).
   2. Confirm the server was started with `--websocket-mask-frame`; without
      it the client retries forever.
-  3. Run `wg-user configtest -c /data/adb/modules/wg-user/etc/wireproxy.conf`
-     on the phone. It catches a malformed `URL`/`Path` locally.
-  4. Prove reachability outside the module: from another host,
+  3. **Check DNS on the phone.** 0.3.0 could not resolve a hostname at all
+     on Android (its Go resolver had no nameserver) and reported it exactly
+     this way, as a silent `reconnecting`. 0.3.1 resolves names with a
+     `ping` fallback, but if DNS is broken the state still shows
+     `reconnecting` with no reason. Run `ping -c 1 your-server.example.com`
+     on the phone: it must print `PING … (203.0.113.10)`. No address means
+     the phone's DNS is down — put the **IP** in `[Transport] URL` (the
+     certificate must then cover that IP, or use `Insecure = true` for a
+     server you control) or fix the phone's connectivity.
+  4. Run `wg-user configtest -c /data/adb/modules/wg-user/etc/wireproxy.conf`
+     on the phone. It catches a malformed `URL`/`Path` locally, and since
+     0.3.1 it resolves `[Peer] Endpoint` names too, so it also reports a
+     hostname the phone cannot resolve.
+  5. Prove reachability outside the module: from another host,
      `curl -i https://your-server.example.com/` (a TLS answer, any status,
      means DNS and TCP 443 work), and if you have the client binary,
      `wstunnel client -L 'udp://127.0.0.1:51820:127.0.0.1:51820?timeout_sec=0'

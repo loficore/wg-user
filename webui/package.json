@@ -1,6 +1,6 @@
 {
   "name": "wg-user-webui",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "private": true,
   "description": "Preact + TypeScript + Tailwind WebUI for the wg-user KernelSU module",
   "type": "module",
